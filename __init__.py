@@ -1,6 +1,6 @@
 """
-ComfyUI-LLPS-v1
-LiveLatentPreviewer & Saver v1
+ComfyUI-LLPS-v1.2
+LiveLatentPreviewer & Saver v1.2
 
 This v1 intentionally avoids global monkeypatching. It provides:
 - LLPS Config: creates preview/save settings.
@@ -187,8 +187,13 @@ def _make_llps_callback(model, steps: int, cfg: LLPSConfigData, node_label: str,
             try:
                 # In some environments the first callback-delivered preview can be a stale warm-up frame.
                 # We still show it live (to keep UI behavior natural), but saving logic below skips callback
-                # step 0 and explicitly flushes the final latent after sampling ends.
+                # step 0 and explicitly flushes the last callback preview after sampling ends.
+                # Do not decode result_samples here: Comfy's previewer expects callback x0-space, while
+                # result_samples may already be in the final latent-output space, which can produce
+                # oversaturated / CFG-burnt looking TAESD previews.
                 preview_tuple = previewer.decode_latent_to_preview_image(preview_format_for_comfy, x0)
+                callback.llps_last_preview_tuple = preview_tuple
+                callback.llps_last_callback_step = int(step)
             except Exception as e:
                 logging.exception("[LLPS] Failed to decode preview at step %s: %s", step, e)
                 preview_tuple = None
@@ -202,7 +207,7 @@ def _make_llps_callback(model, steps: int, cfg: LLPSConfigData, node_label: str,
         if cfg.enabled and cfg.save_preview and preview_tuple is not None:
             # Empirically, saving callback step 0 can capture a stale warm-up frame in some preview methods
             # (notably TAESD on some setups). We therefore skip callback step 0 for file saving, shift
-            # numbering by one, and force-save the final latent after sampling completes.
+            # numbering by one, and force-save the last callback preview after sampling completes.
             if step > 0:
                 adjusted_step = step - 1
                 if (adjusted_step % cfg.save_every_n_steps) == 0:
@@ -227,6 +232,8 @@ def _make_llps_callback(model, steps: int, cfg: LLPSConfigData, node_label: str,
     callback.llps_config = cfg
     callback.llps_previewer = previewer
     callback.llps_preview_format = preview_format_for_comfy
+    callback.llps_last_preview_tuple = None
+    callback.llps_last_callback_step = None
     return callback
 
 
@@ -355,15 +362,19 @@ class LLPSKSampler:
             seed=int(seed),
         )
 
-        # Explicitly flush the final preview from the finished latent. This fixes the common case
-        # where callback-delivered previews are effectively one frame late for file saving.
-        if cfg_data.enabled and cfg_data.save_preview and callback.llps_save_dir and callback.llps_previewer is not None:
+        # Explicitly flush the last callback preview as the final saved frame.
+        # Important: do NOT decode result_samples with the previewer here. Comfy's previewer is built
+        # for the sampler callback's x0 tensor. Feeding the final returned latent can place the tensor
+        # in the wrong latent space for TAESD/latent2rgb and creates oversaturated final previews.
+        if (
+            cfg_data.enabled
+            and cfg_data.save_preview
+            and callback.llps_save_dir
+            and callback.llps_last_preview_tuple is not None
+        ):
             try:
-                final_preview_tuple = callback.llps_previewer.decode_latent_to_preview_image(
-                    callback.llps_preview_format, result_samples
-                )
                 saved = _save_preview_image(
-                    final_preview_tuple,
+                    callback.llps_last_preview_tuple,
                     callback.llps_save_dir,
                     cfg_data,
                     node_label,
@@ -375,7 +386,7 @@ class LLPSKSampler:
                 if saved:
                     callback.llps_saved_files.append(saved)
             except Exception as e:
-                logging.exception("[LLPS] Failed to flush final preview image: %s", e)
+                logging.exception("[LLPS] Failed to flush final callback preview image: %s", e)
 
         out = latent_image.copy()
         out["samples"] = result_samples

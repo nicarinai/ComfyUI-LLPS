@@ -6,6 +6,7 @@ This v1 provides two nodes:
 
 - **LLPS Config**: choose live preview method, show/save toggles, save path, filename, image format, interval.
 - **LLPS KSampler**: KSampler-compatible node that uses `LLPS_CONFIG` instead of ComfyUI's global live preview setting.
+- **LLPS Manager panel**: frontend workflow scanner for sampler-like nodes and LLPS-controlled status.
 
 ## v1 design boundary
 
@@ -29,6 +30,20 @@ Restart ComfyUI.
 2. Add `LLPS KSampler`.
 3. Connect `LLPS Config.llps_config` to `LLPS KSampler.llps_config`.
 4. Use `LLPS KSampler` in place of the normal `KSampler`.
+
+## LLPS Manager panel
+
+After restarting ComfyUI, use the floating **LLPS** button or the **LLPS** menu to open the manager panel.
+
+The panel scans the current workflow and shows:
+
+- LLPS nodes
+- sampler-like nodes such as `KSampler`, `KSamplerAdvanced`, `SamplerCustom`, and `SamplerCustomAdvanced`
+- whether each sampler is LLPS-controlled, uncontrolled, or a candidate
+- node id, node type, node title
+- **Focus** and **Refresh** actions
+
+When the panel is open, matching nodes are visually marked on the canvas.
 
 ## Settings
 

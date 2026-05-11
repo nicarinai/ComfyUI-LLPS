@@ -4,6 +4,7 @@ LiveLatentPreviewer & Saver v1.2
 
 This v1 intentionally avoids global monkeypatching. It provides:
 - LLPS Config: creates preview/save settings.
+- LLPS Controller: workflow-level preview management declaration for v2 UI.
 - LLPS KSampler: KSampler-compatible sampler that uses LLPS settings for live latent preview and/or saving.
 """
 
@@ -292,6 +293,65 @@ class LLPSConfig:
         return (asdict(LLPSConfigData.from_obj(asdict(cfg))),)
 
 
+class LLPSController:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "enabled": ("BOOLEAN", {"default": True}),
+                "scope": (["all_sampler_like", "legacy_llps_only", "none"], {"default": "all_sampler_like"}),
+                "live_preview_method": (["server_default", "none", "auto", "latent2rgb", "taesd"], {"default": "latent2rgb"}),
+                "show_preview": ("BOOLEAN", {"default": True}),
+                "save_preview": ("BOOLEAN", {"default": False}),
+                "save_base_path": ("STRING", {"default": "", "multiline": False}),
+                "subfolder": ("STRING", {"default": "", "multiline": False}),
+                "filename_prefix": ("STRING", {"default": "LLPS", "multiline": False}),
+                "image_format": (["jpg", "png", "webp"], {"default": "jpg"}),
+                "save_every_n_steps": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
+                "save_metadata_json": ("BOOLEAN", {"default": True}),
+                "jpeg_quality": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("LLPS_CONTROLLER",)
+    RETURN_NAMES = ("llps_controller",)
+    FUNCTION = "make_controller"
+    CATEGORY = LLPS_CATEGORY
+
+    def make_controller(
+        self,
+        enabled=True,
+        scope="all_sampler_like",
+        live_preview_method="latent2rgb",
+        show_preview=True,
+        save_preview=False,
+        save_base_path="",
+        subfolder="",
+        filename_prefix="LLPS",
+        image_format="jpg",
+        save_every_n_steps=1,
+        save_metadata_json=True,
+        jpeg_quality=90,
+    ):
+        cfg = LLPSConfigData(
+            enabled=enabled,
+            live_preview_method=live_preview_method,
+            show_preview=show_preview,
+            save_preview=save_preview,
+            save_base_path=save_base_path,
+            subfolder=subfolder,
+            filename_prefix=filename_prefix,
+            image_format=image_format,
+            save_every_n_steps=save_every_n_steps,
+            save_metadata_json=save_metadata_json,
+            jpeg_quality=jpeg_quality,
+        )
+        controller = asdict(LLPSConfigData.from_obj(asdict(cfg)))
+        controller["scope"] = str(scope or "all_sampler_like")
+        controller["node"] = "LLPS Controller"
+        return (controller,)
+
+
 class LLPSKSampler:
     @classmethod
     def INPUT_TYPES(cls):
@@ -417,11 +477,13 @@ class LLPSKSampler:
 
 NODE_CLASS_MAPPINGS = {
     "LLPSConfig": LLPSConfig,
+    "LLPSController": LLPSController,
     "LLPSKSampler": LLPSKSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LLPSConfig": "LLPS Config",
+    "LLPSController": "LLPS Controller",
     "LLPSKSampler": "LLPS KSampler",
 }
 

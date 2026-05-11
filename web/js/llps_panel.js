@@ -206,6 +206,11 @@ function injectStyles() {
       border-left-color: #60a5fa;
     }
 
+    .llps-node-row[data-status="legacy"] {
+      border-left-color: #a78bfa;
+      opacity: 0.88;
+    }
+
     .llps-node-title {
       font-weight: 700;
       overflow-wrap: anywhere;
@@ -245,6 +250,10 @@ function injectStyles() {
 
     .llps-pill[data-status="llps"] {
       background: #60a5fa;
+    }
+
+    .llps-pill[data-status="legacy"] {
+      background: #a78bfa;
     }
 
     .llps-empty {
@@ -346,7 +355,7 @@ function analyzeNode(node, controllers) {
     };
   }
   if (isLLPSConfig(node)) {
-    return { status: "llps", detail: "legacy v1.2 config node" };
+    return { status: "legacy", detail: "deprecated v1.2 config compatibility node" };
   }
   if (isSamplerLike(node)) {
     const coveredBy = coveringControllers(node, controllers);
@@ -390,6 +399,8 @@ function statusLabel(status) {
       return "candidate";
     case "llps":
       return "LLPS";
+    case "legacy":
+      return "legacy";
     default:
       return "unknown";
   }
@@ -472,6 +483,7 @@ function renderFilters(counts) {
     ["uncontrolled", `Uncontrolled ${counts.uncontrolled}`],
     ["candidate", `Candidate ${counts.candidate}`],
     ["llps", `LLPS ${counts.llps}`],
+    ["legacy", `Legacy ${counts.legacy}`],
   ];
 
   filters.replaceChildren();
@@ -498,14 +510,14 @@ function renderPanel() {
       acc[item.status] = (acc[item.status] || 0) + 1;
       return acc;
     },
-    { controlled: 0, uncontrolled: 0, candidate: 0, llps: 0 }
+    { controlled: 0, uncontrolled: 0, candidate: 0, llps: 0, legacy: 0 }
   );
 
   summary.replaceChildren(
     createStat("controlled", counts.controlled),
     createStat("uncontrolled", counts.uncontrolled),
     createStat("candidate", counts.candidate),
-    createStat("LLPS nodes", counts.llps)
+    createStat("LLPS nodes", counts.llps + counts.legacy)
   );
   renderFilters(counts);
 

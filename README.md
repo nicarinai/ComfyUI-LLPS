@@ -4,10 +4,9 @@ LLPS = **LiveLatentPreviewer & Saver**.
 
 This v2-alpha provides three nodes and a manager panel:
 
-- **LLPS Config**: choose live preview method, show/save toggles, save path, filename, image format, interval.
 - **LLPS Controller**: workflow-level declaration for LLPS preview management.
-- **LLPS KSampler**: legacy/prototype KSampler-compatible node that uses `LLPS_CONFIG` for callback-based preview saving.
 - **LLPS Manager panel**: frontend workflow scanner for sampler-like nodes and LLPS-controlled status.
+- **LLPS Config (Legacy)** and **LLPS KSampler (Legacy)**: deprecated v1.2 compatibility nodes for callback-based preview saving.
 
 ## v2-alpha design boundary
 

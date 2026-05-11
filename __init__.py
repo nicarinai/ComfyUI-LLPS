@@ -3,9 +3,8 @@ ComfyUI-LLPS-v1.2
 LiveLatentPreviewer & Saver v1.2
 
 This v1 intentionally avoids global monkeypatching. It provides:
-- LLPS Config: creates preview/save settings.
 - LLPS Controller: workflow-level preview management declaration for v2 UI.
-- LLPS KSampler: KSampler-compatible sampler that uses LLPS settings for live latent preview and/or saving.
+- Legacy LLPS Config and LLPS KSampler nodes for v1.2 callback-based preview saving.
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ import latent_preview
 
 
 LLPS_CATEGORY = "LLPS/Live Latent Preview"
+LLPS_LEGACY_CATEGORY = "LLPS/Legacy v1.2"
 
 
 def _sanitize_piece(text: str, fallback: str = "LLPS") -> str:
@@ -261,7 +261,7 @@ class LLPSConfig:
     RETURN_TYPES = ("LLPS_CONFIG",)
     RETURN_NAMES = ("llps_config",)
     FUNCTION = "make_config"
-    CATEGORY = LLPS_CATEGORY
+    CATEGORY = LLPS_LEGACY_CATEGORY
 
     def make_config(
         self,
@@ -373,7 +373,7 @@ class LLPSKSampler:
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("latent",)
     FUNCTION = "sample"
-    CATEGORY = LLPS_CATEGORY
+    CATEGORY = LLPS_LEGACY_CATEGORY
 
     def sample(
         self,
@@ -478,9 +478,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LLPSConfig": "LLPS Config",
+    "LLPSConfig": "LLPS Config (Legacy)",
     "LLPSController": "LLPS Controller",
-    "LLPSKSampler": "LLPS KSampler",
+    "LLPSKSampler": "LLPS KSampler (Legacy)",
 }
 
 WEB_DIRECTORY = "./web/js"

@@ -10,6 +10,9 @@ const SAMPLER_TYPES = new Set([
   "SamplerCustom",
   "SamplerCustomAdvanced",
   "LLPSKSampler",
+  "UltimateSDUpscale",
+  "UltimateSDUpscaleNoUpscale",
+  "UltimateSDUpscaleCustomSample",
 ]);
 
 const SAMPLER_WIDGET_NAMES = new Set([
@@ -20,13 +23,15 @@ const SAMPLER_WIDGET_NAMES = new Set([
   "denoise",
 ]);
 
-const LLPS_NODE_TYPES = new Set(["LLPSConfig", "LLPSKSampler"]);
+const LLPS_NODE_TYPES = new Set(["LLPSController", "LLPSConfig"]);
 
 let panel;
 let list;
 let summary;
+let filters;
 let toggleButton;
 let lastScan = [];
+let activeStatusFilter = "all";
 let patchedDrawNode = false;
 
 function injectStyles() {
@@ -113,7 +118,7 @@ function injectStyles() {
 
     .llps-panel-summary {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap: 8px;
       padding: 10px 12px;
       border-bottom: 1px solid rgba(156, 163, 175, 0.18);
@@ -139,6 +144,31 @@ function injectStyles() {
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+    }
+
+    .llps-panel-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(156, 163, 175, 0.18);
+    }
+
+    .llps-filter {
+      height: 26px;
+      border: 1px solid rgba(156, 163, 175, 0.32);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      color: #f6f7fb;
+      padding: 0 9px;
+      cursor: pointer;
+      font: 700 11px/1 system-ui, sans-serif;
+    }
+
+    .llps-filter.llps-active {
+      background: #f6f7fb;
+      color: #111827;
+      border-color: #f6f7fb;
     }
 
     .llps-node-list {
@@ -249,9 +279,15 @@ function hasSamplerWidgets(node) {
   return names.filter((name) => SAMPLER_WIDGET_NAMES.has(name)).length >= 3;
 }
 
-function hasSamplerInputs(node) {
+function hasLatentSamplerInputs(node) {
   const names = getInputs(node).map((input) => input?.name).filter(Boolean);
   return ["positive", "negative", "latent_image"].every((name) => names.includes(name));
+}
+
+function hasImg2ImgSamplerInputs(node) {
+  const names = getInputs(node).map((input) => input?.name).filter(Boolean);
+  const hasImageSource = names.some((name) => ["image", "upscaled_image", "pixels"].includes(name));
+  return hasImageSource && ["model", "positive", "negative"].every((name) => names.includes(name));
 }
 
 function isSamplerLike(node) {
@@ -261,36 +297,98 @@ function isSamplerLike(node) {
   if (SAMPLER_TYPES.has(node.type)) {
     return true;
   }
-  return hasSamplerWidgets(node) && hasSamplerInputs(node);
+  return hasSamplerWidgets(node) && (hasLatentSamplerInputs(node) || hasImg2ImgSamplerInputs(node));
 }
 
 function isLLPSConfig(node) {
   return node?.type === "LLPSConfig";
 }
 
+function isLLPSController(node) {
+  return node?.type === "LLPSController";
+}
+
 function isLLPSSampler(node) {
   return node?.type === "LLPSKSampler";
 }
 
-function hasLLPSConfigInput(node) {
-  return getInputs(node).some((input) => {
-    const type = Array.isArray(input?.type) ? input.type.join(",") : String(input?.type || "");
-    return input?.name === "llps_config" || type.includes("LLPS_CONFIG");
-  });
+function widgetValue(node, name, fallback = undefined) {
+  const widget = getWidgets(node).find((item) => item?.name === name);
+  return widget ? widget.value : fallback;
 }
 
-function classifyNode(node) {
-  if (isLLPSConfig(node)) {
-    return "llps";
+function isControllerEnabled(controller) {
+  return widgetValue(controller, "enabled", true) === true;
+}
+
+function controllerScope(controller) {
+  return String(widgetValue(controller, "scope", "all_sampler_like") || "all_sampler_like");
+}
+
+function controllerCoversNode(controller, node) {
+  if (!controller || !isControllerEnabled(controller)) {
+    return false;
   }
-  if (isLLPSSampler(node)) {
-    return "controlled";
+
+  const scope = controllerScope(controller);
+  if (scope === "none") {
+    return false;
+  }
+  if (scope === "legacy_llps_only") {
+    return isLLPSSampler(node);
+  }
+  return isSamplerLike(node);
+}
+
+function activeControllers() {
+  const nodes = Array.isArray(app.graph?._nodes) ? app.graph._nodes : [];
+  return nodes.filter((node) => isLLPSController(node) && isControllerEnabled(node) && controllerScope(node) !== "none");
+}
+
+function coveringControllers(node, controllers) {
+  return controllers.filter((controller) => controllerCoversNode(controller, node));
+}
+
+function analyzeNode(node, controllers) {
+  if (isLLPSController(node)) {
+    const enabled = isControllerEnabled(node);
+    const scope = controllerScope(node);
+    return {
+      status: "llps",
+      detail: `${enabled ? "workflow controller" : "disabled controller"} / scope: ${scope}`,
+    };
+  }
+  if (isLLPSConfig(node)) {
+    return { status: "llps", detail: "legacy v1.2 config node" };
   }
   if (isSamplerLike(node)) {
-    return hasLLPSConfigInput(node) ? "candidate" : "uncontrolled";
+    const coveredBy = coveringControllers(node, controllers);
+    if (coveredBy.length) {
+      return {
+        status: "controlled",
+        detail: `covered by LLPS Controller #${coveredBy[0].id}`,
+        controlledBy: coveredBy.map((controller) => controller.id),
+      };
+    }
+
+    if (controllers.length) {
+      return {
+        status: "uncontrolled",
+        detail: isLLPSSampler(node)
+          ? "legacy LLPS KSampler outside current Controller scope"
+          : "sampler-like node outside current Controller scope",
+      };
+    }
+
+    return {
+      status: "candidate",
+      detail: isLLPSSampler(node)
+        ? "legacy LLPS KSampler; add/enable LLPS Controller for workflow control"
+        : "sampler-like node; add/enable LLPS Controller for workflow control",
+    };
   }
   if (LLPS_NODE_TYPES.has(node?.type)) {
-    return "llps";
+    return { status: "llps", detail: "LLPS node" };
   }
   return null;
 }
@@ -312,19 +410,23 @@ function statusLabel(status) {
 
 function scanWorkflow() {
   const nodes = Array.isArray(app.graph?._nodes) ? app.graph._nodes : [];
+  const controllers = activeControllers();
   lastScan = nodes
     .map((node) => {
-      const status = classifyNode(node);
-      if (!status) {
+      const analysis = analyzeNode(node, controllers);
+      if (!analysis) {
         delete node.__llpsStatus;
         return null;
       }
+      const { status, detail, controlledBy } = analysis;
       node.__llpsStatus = status;
       return {
         id: node.id,
         type: node.type,
         title: nodeTitle(node),
         status,
+        detail,
+        controlledBy,
         node,
       };
     })
@@ -349,11 +451,54 @@ function focusNode(nodeId) {
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
+function selectNodesByStatus(status) {
+  const matches = lastScan.filter((item) => item.status === status).map((item) => item.node).filter(Boolean);
+  if (!matches.length || !app.canvas?.selectNode) {
+    return;
+  }
+  matches.forEach((node, index) => app.canvas.selectNode(node, index !== 0));
+  app.graph?.setDirtyCanvas?.(true, true);
+}
+
 function createStat(label, value) {
   const item = document.createElement("div");
   item.className = "llps-stat";
   item.innerHTML = `<strong>${value}</strong><span>${label}</span>`;
   return item;
+}
+
+function filterItems() {
+  if (activeStatusFilter === "all") {
+    return lastScan;
+  }
+  return lastScan.filter((item) => item.status === activeStatusFilter);
+}
+
+function renderFilters(counts) {
+  if (!filters) {
+    return;
+  }
+
+  const options = [
+    ["all", `All ${lastScan.length}`],
+    ["controlled", `Controlled ${counts.controlled}`],
+    ["uncontrolled", `Uncontrolled ${counts.uncontrolled}`],
+    ["candidate", `Candidate ${counts.candidate}`],
+    ["llps", `LLPS ${counts.llps}`],
+  ];
+
+  filters.replaceChildren();
+  for (const [status, label] of options) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `llps-filter${activeStatusFilter === status ? " llps-active" : ""}`;
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      activeStatusFilter = status;
+      renderPanel();
+    });
+    filters.appendChild(button);
+  }
 }
 
 function renderPanel() {
@@ -372,19 +517,22 @@ function renderPanel() {
   summary.replaceChildren(
     createStat("controlled", counts.controlled),
     createStat("uncontrolled", counts.uncontrolled),
+    createStat("candidate", counts.candidate),
     createStat("LLPS nodes", counts.llps)
   );
+  renderFilters(counts);
 
   list.replaceChildren();
-  if (!lastScan.length) {
+  const visibleItems = filterItems();
+  if (!visibleItems.length) {
     const empty = document.createElement("div");
     empty.className = "llps-empty";
-    empty.textContent = "No LLPS or sampler-like nodes found.";
+    empty.textContent = lastScan.length ? "No nodes match the current filter." : "No LLPS or sampler-like nodes found.";
     list.appendChild(empty);
     return;
   }
 
-  for (const item of lastScan) {
+  for (const item of visibleItems) {
     const row = document.createElement("div");
     row.className = "llps-node-row";
     row.dataset.status = item.status;
@@ -398,7 +546,11 @@ function renderPanel() {
     meta.className = "llps-node-meta";
     meta.textContent = `#${item.id} / ${item.type}`;
 
-    text.append(title, meta);
+    const detail = document.createElement("div");
+    detail.className = "llps-node-meta";
+    detail.textContent = item.detail || statusLabel(item.status);
+
+    text.append(title, meta, detail);
 
     const actions = document.createElement("div");
     const pill = document.createElement("span");
@@ -453,6 +605,13 @@ function createPanel() {
   refresh.title = "Scan the current workflow again";
   refresh.addEventListener("click", scanWorkflow);
 
+  const selectUncontrolled = document.createElement("button");
+  selectUncontrolled.className = "llps-panel-button";
+  selectUncontrolled.type = "button";
+  selectUncontrolled.textContent = "Select";
+  selectUncontrolled.title = "Select all uncontrolled sampler-like nodes on the canvas";
+  selectUncontrolled.addEventListener("click", () => selectNodesByStatus("uncontrolled"));
+
   const close = document.createElement("button");
   close.className = "llps-panel-button";
   close.type = "button";
@@ -460,16 +619,19 @@ function createPanel() {
   close.title = "Close LLPS manager";
   close.addEventListener("click", () => panel.classList.remove("llps-open"));
 
-  actions.append(refresh, close);
+  actions.append(selectUncontrolled, refresh, close);
   header.append(title, actions);
 
   summary = document.createElement("div");
   summary.className = "llps-panel-summary";
 
+  filters = document.createElement("div");
+  filters.className = "llps-panel-filters";
+
   list = document.createElement("div");
   list.className = "llps-node-list";
 
-  panel.append(header, summary, list);
+  panel.append(header, summary, filters, list);
   document.body.append(panel, toggleButton);
   scanWorkflow();
 }

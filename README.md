@@ -2,17 +2,18 @@
 
 LLPS = **LiveLatentPreviewer & Saver**.
 
-This v1 provides two nodes:
+This v2-alpha provides three nodes and a manager panel:
 
 - **LLPS Config**: choose live preview method, show/save toggles, save path, filename, image format, interval.
-- **LLPS KSampler**: KSampler-compatible node that uses `LLPS_CONFIG` instead of ComfyUI's global live preview setting.
+- **LLPS Controller**: workflow-level declaration for LLPS preview management scope.
+- **LLPS KSampler**: legacy/prototype KSampler-compatible node that uses `LLPS_CONFIG` for callback-based preview saving.
 - **LLPS Manager panel**: frontend workflow scanner for sampler-like nodes and LLPS-controlled status.
 
-## v1 design boundary
+## v2-alpha design boundary
 
-This version does **not** globally override every KSampler in the workflow. Only **LLPS KSampler** follows LLPS settings. Other samplers keep using ComfyUI's own settings.
+This version does **not** globally override every sampler in the workflow yet. The **LLPS Controller** is the workflow-level authority used by the Manager panel to classify sampler-like nodes as controlled, uncontrolled, or candidate.
 
-That is intentional: it avoids global monkeypatch/race-condition issues and makes the graph explicit.
+`LLPS KSampler` remains available as a legacy/prototype node for v1.2 callback-based preview saving, but it is not the architectural center of LLPS v2.
 
 ## Install
 
@@ -26,10 +27,12 @@ Restart ComfyUI.
 
 ## Basic use
 
-1. Add `LLPS Config`.
-2. Add `LLPS KSampler`.
-3. Connect `LLPS Config.llps_config` to `LLPS KSampler.llps_config`.
-4. Use `LLPS KSampler` in place of the normal `KSampler`.
+1. Add `LLPS Controller`.
+2. Open the **LLPS Manager** panel.
+3. Use **Refresh** to scan sampler-like nodes in the workflow.
+4. Use the panel to inspect which nodes are covered by the Controller scope.
+
+For legacy v1.2 preview saving, `LLPS Config` can still be connected to `LLPS KSampler`.
 
 ## LLPS Manager panel
 
@@ -38,10 +41,11 @@ After restarting ComfyUI, use the floating **LLPS** button or the **LLPS** menu 
 The panel scans the current workflow and shows:
 
 - LLPS nodes
-- sampler-like nodes such as `KSampler`, `KSamplerAdvanced`, `SamplerCustom`, and `SamplerCustomAdvanced`
+- sampler-like nodes such as `KSampler`, `KSamplerAdvanced`, `SamplerCustom`, `SamplerCustomAdvanced`, and Ultimate SD Upscale nodes
 - whether each sampler is LLPS-controlled, uncontrolled, or a candidate
+- Controller coverage status for sampler-like nodes
 - node id, node type, node title
-- **Focus** and **Refresh** actions
+- status filters, **Focus**, **Refresh**, and uncontrolled-node selection actions
 
 When the panel is open, matching nodes are visually marked on the canvas.
 

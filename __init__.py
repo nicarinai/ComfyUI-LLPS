@@ -748,11 +748,19 @@ def _prompt_int(prompt: Dict[str, Any], value: Any, default: int) -> int:
         return default
 
 
+def _prompt_node_sort_key(node_id: Any) -> Tuple[int, Any]:
+    try:
+        return (0, int(node_id))
+    except Exception:
+        return (1, str(node_id))
+
+
 def _active_controller_from_prompt(prompt: Optional[Dict[str, Any]]) -> Optional[LLPSControllerData]:
     if not isinstance(prompt, dict):
         return None
 
-    for node_id in sorted(prompt.keys(), key=lambda x: str(x)):
+    enabled_controllers = []
+    for node_id in sorted(prompt.keys(), key=_prompt_node_sort_key):
         node = prompt.get(node_id)
         if not isinstance(node, dict) or node.get("class_type") != "LLPSController":
             continue
@@ -781,7 +789,16 @@ def _active_controller_from_prompt(prompt: Optional[Dict[str, Any]]) -> Optional
                 "controller_node_id": str(node_id),
             }
         )
-        return controller
+        enabled_controllers.append(controller)
+
+    if enabled_controllers:
+        if len(enabled_controllers) > 1:
+            logging.info(
+                "[LLPS] Multiple enabled Controllers found; using #%s and ignoring %s",
+                enabled_controllers[0].controller_node_id,
+                [item.controller_node_id for item in enabled_controllers[1:]],
+            )
+        return enabled_controllers[0]
 
     return None
 

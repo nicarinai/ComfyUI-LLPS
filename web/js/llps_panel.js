@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 const EXTENSION_NAME = "ComfyUI.LLPS.Panel";
 const PANEL_ID = "llps-manager-panel";
@@ -29,10 +30,12 @@ let panel;
 let list;
 let summary;
 let filters;
+let previews;
 let toggleButton;
 let lastScan = [];
 let activeStatusFilter = "all";
 let patchedDrawNode = false;
+const previewStreams = new Map();
 
 function injectStyles() {
   if (document.getElementById("llps-manager-style")) {
@@ -152,6 +155,91 @@ function injectStyles() {
       gap: 6px;
       padding: 8px 12px;
       border-bottom: 1px solid rgba(156, 163, 175, 0.18);
+    }
+
+    .llps-preview-streams {
+      display: none;
+      gap: 8px;
+      grid-template-columns: 1fr;
+      padding: 8px;
+      border-bottom: 1px solid rgba(156, 163, 175, 0.18);
+      overflow: auto;
+      max-height: 360px;
+    }
+
+    .llps-preview-streams.llps-has-streams {
+      display: grid;
+    }
+
+    .llps-preview-card {
+      border: 1px solid rgba(156, 163, 175, 0.24);
+      border-radius: 7px;
+      padding: 8px;
+      background: rgba(255, 255, 255, 0.055);
+    }
+
+    .llps-preview-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 7px;
+    }
+
+    .llps-preview-title {
+      font-weight: 700;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .llps-preview-image {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: contain;
+      background: rgba(0, 0, 0, 0.28);
+      border-radius: 5px;
+      display: block;
+    }
+
+    .llps-preview-empty {
+      display: grid;
+      place-items: center;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      border-radius: 5px;
+      background: rgba(0, 0, 0, 0.24);
+      color: rgba(246, 247, 251, 0.64);
+    }
+
+    .llps-progress-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      margin-top: 7px;
+      color: rgba(246, 247, 251, 0.78);
+    }
+
+    .llps-progress-track {
+      height: 5px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(156, 163, 175, 0.22);
+    }
+
+    .llps-progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #60a5fa;
+    }
+
+    .llps-preview-meta {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 10px;
+      margin-top: 7px;
+      color: rgba(246, 247, 251, 0.72);
+      overflow-wrap: anywhere;
     }
 
     .llps-filter {
@@ -458,11 +546,121 @@ function selectNodesByStatus(status) {
   app.graph?.setDirtyCanvas?.(true, true);
 }
 
+function previewStreamKey(data) {
+  return String(data?.sampler_node_id || data?.sampler_label || data?.run_id || "unknown");
+}
+
+function updatePreviewStream(data) {
+  if (!data) {
+    return;
+  }
+  const key = previewStreamKey(data);
+  const previous = previewStreams.get(key) || {};
+  previewStreams.set(key, {
+    ...previous,
+    ...data,
+    image: data.image || previous.image,
+    updatedAt: Date.now(),
+  });
+  renderPanel();
+}
+
+function clearPreviewStreams() {
+  previewStreams.clear();
+  renderPanel();
+}
+
 function createStat(label, value) {
   const item = document.createElement("div");
   item.className = "llps-stat";
   item.innerHTML = `<strong>${value}</strong><span>${label}</span>`;
   return item;
+}
+
+function createPreviewMeta(label, value) {
+  const item = document.createElement("div");
+  item.textContent = `${label}: ${value || "-"}`;
+  return item;
+}
+
+function renderPreviewStreams() {
+  if (!previews) {
+    return;
+  }
+
+  previews.replaceChildren();
+  const streams = [...previewStreams.values()].sort((a, b) => Number(a.sampler_node_id || 0) - Number(b.sampler_node_id || 0));
+  previews.classList.toggle("llps-has-streams", streams.length > 0);
+
+  for (const stream of streams) {
+    const node = app.graph?.getNodeById?.(Number(stream.sampler_node_id));
+    const card = document.createElement("article");
+    card.className = "llps-preview-card";
+
+    const head = document.createElement("div");
+    head.className = "llps-preview-card-head";
+
+    const title = document.createElement("div");
+    title.className = "llps-preview-title";
+    title.textContent = node
+      ? `${nodeTitle(node)} #${stream.sampler_node_id}`
+      : `${stream.sampler_label || stream.sampler_node_type || "Sampler"} #${stream.sampler_node_id || "-"}`;
+
+    const focus = document.createElement("button");
+    focus.className = "llps-panel-button";
+    focus.type = "button";
+    focus.textContent = "Focus";
+    focus.title = "Focus this sampler node on the canvas";
+    focus.addEventListener("click", () => focusNode(Number(stream.sampler_node_id)));
+
+    head.append(title, focus);
+    card.appendChild(head);
+
+    if (stream.image) {
+      const img = document.createElement("img");
+      img.className = "llps-preview-image";
+      img.alt = title.textContent;
+      img.src = stream.image;
+      card.appendChild(img);
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "llps-preview-empty";
+      empty.textContent = "Waiting for preview";
+      card.appendChild(empty);
+    }
+
+    const step = Number(stream.step || 0);
+    const total = Number(stream.total_steps || 0);
+    const percent = total > 0 ? Math.max(0, Math.min(100, Math.round((step / total) * 100))) : 0;
+
+    const progress = document.createElement("div");
+    progress.className = "llps-progress-row";
+
+    const track = document.createElement("div");
+    track.className = "llps-progress-track";
+    const fill = document.createElement("div");
+    fill.className = "llps-progress-fill";
+    fill.style.width = `${percent}%`;
+    track.appendChild(fill);
+
+    const stepText = document.createElement("div");
+    stepText.textContent = total > 0 ? `${step} / ${total}` : "-";
+
+    progress.append(track, stepText);
+    card.appendChild(progress);
+
+    const meta = document.createElement("div");
+    meta.className = "llps-preview-meta";
+    meta.append(
+      createPreviewMeta("method", stream.method || stream.previewer_class),
+      createPreviewMeta("status", stream.filename_resolution_status || (stream.save_also ? "saving" : "preview")),
+      createPreviewMeta("subfolder", stream.effective_subfolder),
+      createPreviewMeta("last file", stream.last_saved_file)
+    );
+    card.appendChild(meta);
+
+    previews.appendChild(card);
+  }
 }
 
 function filterItems() {
@@ -520,6 +718,7 @@ function renderPanel() {
     createStat("LLPS nodes", counts.llps + counts.legacy)
   );
   renderFilters(counts);
+  renderPreviewStreams();
 
   list.replaceChildren();
   const visibleItems = filterItems();
@@ -627,10 +826,13 @@ function createPanel() {
   filters = document.createElement("div");
   filters.className = "llps-panel-filters";
 
+  previews = document.createElement("div");
+  previews.className = "llps-preview-streams";
+
   list = document.createElement("div");
   list.className = "llps-node-list";
 
-  panel.append(header, summary, filters, list);
+  panel.append(header, summary, filters, previews, list);
   document.body.append(panel, toggleButton);
   scanWorkflow();
 }
@@ -709,6 +911,8 @@ function registerMenuCommand() {
     setup() {
       createPanel();
       patchCanvasBadges();
+      api.addEventListener("llps_preview", ({ detail }) => updatePreviewStream(detail));
+      api.addEventListener("execution_start", clearPreviewStreams);
     },
     nodeCreated() {
       window.setTimeout(scanWorkflow, 0);

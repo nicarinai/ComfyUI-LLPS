@@ -31,9 +31,12 @@ let list;
 let summary;
 let filters;
 let previews;
+let tabs;
+let nodesSection;
 let toggleButton;
 let lastScan = [];
 let activeStatusFilter = "all";
+let activeManagerTab = "streams";
 let patchedDrawNode = false;
 const previewStreams = new Map();
 
@@ -66,7 +69,10 @@ function injectStyles() {
       right: 16px;
       bottom: 60px;
       z-index: 999;
-      width: min(380px, calc(100vw - 32px));
+      width: min(560px, calc(100vw - 32px));
+      min-width: 360px;
+      min-height: 320px;
+      height: min(620px, calc(100vh - 90px));
       max-height: min(620px, calc(100vh - 90px));
       display: none;
       flex-direction: column;
@@ -77,10 +83,15 @@ function injectStyles() {
       box-shadow: 0 16px 44px rgba(0, 0, 0, 0.38);
       font: 12px/1.4 system-ui, sans-serif;
       overflow: hidden;
+      resize: both;
     }
 
     #${PANEL_ID}.llps-open {
       display: flex;
+    }
+
+    #${PANEL_ID} [hidden] {
+      display: none !important;
     }
 
     .llps-panel-header {
@@ -91,6 +102,8 @@ function injectStyles() {
       padding: 10px 12px;
       border-bottom: 1px solid rgba(156, 163, 175, 0.26);
       background: rgba(36, 41, 51, 0.92);
+      cursor: move;
+      user-select: none;
     }
 
     .llps-panel-title {
@@ -101,6 +114,45 @@ function injectStyles() {
     .llps-panel-actions {
       display: flex;
       gap: 6px;
+    }
+
+    .llps-panel-actions {
+      cursor: default;
+    }
+
+    .llps-panel-tabs {
+      display: flex;
+      gap: 6px;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(156, 163, 175, 0.18);
+      background: rgba(18, 21, 28, 0.7);
+    }
+
+    .llps-tab {
+      height: 28px;
+      border: 1px solid rgba(156, 163, 175, 0.32);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.06);
+      color: #f6f7fb;
+      padding: 0 10px;
+      cursor: pointer;
+      font: 700 12px/1 system-ui, sans-serif;
+    }
+
+    .llps-tab.llps-active {
+      background: #f6f7fb;
+      border-color: #f6f7fb;
+      color: #111827;
+    }
+
+    .llps-section {
+      min-height: 0;
+      flex: 1;
+      overflow: auto;
+    }
+
+    .llps-section[hidden] {
+      display: none;
     }
 
     .llps-panel-button {
@@ -158,17 +210,13 @@ function injectStyles() {
     }
 
     .llps-preview-streams {
-      display: none;
-      gap: 8px;
-      grid-template-columns: 1fr;
-      padding: 8px;
-      border-bottom: 1px solid rgba(156, 163, 175, 0.18);
-      overflow: auto;
-      max-height: 360px;
-    }
-
-    .llps-preview-streams.llps-has-streams {
       display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      padding: 8px;
+      min-height: 0;
+      flex: 1;
+      overflow: auto;
     }
 
     .llps-preview-card {
@@ -294,6 +342,11 @@ function injectStyles() {
       border-left-color: #60a5fa;
     }
 
+    .llps-node-row[data-status="ignored"] {
+      border-left-color: #94a3b8;
+      opacity: 0.9;
+    }
+
     .llps-node-row[data-status="legacy"] {
       border-left-color: #a78bfa;
       opacity: 0.88;
@@ -338,6 +391,10 @@ function injectStyles() {
 
     .llps-pill[data-status="llps"] {
       background: #60a5fa;
+    }
+
+    .llps-pill[data-status="ignored"] {
+      background: #94a3b8;
     }
 
     .llps-pill[data-status="legacy"] {
@@ -414,6 +471,11 @@ function widgetValue(node, name, fallback = undefined) {
   return widget ? widget.value : fallback;
 }
 
+function nodeSortValue(node) {
+  const value = Number(node?.id);
+  return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+}
+
 function isControllerEnabled(controller) {
   return widgetValue(controller, "enabled", true) === true;
 }
@@ -425,42 +487,78 @@ function controllerCoversNode(controller, node) {
   return isSamplerLike(node);
 }
 
-function activeControllers() {
+function allControllers() {
   const nodes = Array.isArray(app.graph?._nodes) ? app.graph._nodes : [];
-  return nodes.filter((node) => isLLPSController(node) && isControllerEnabled(node));
+  return nodes.filter(isLLPSController).sort((a, b) => nodeSortValue(a) - nodeSortValue(b));
+}
+
+function enabledControllers() {
+  return allControllers().filter(isControllerEnabled);
+}
+
+function activeController() {
+  return enabledControllers()[0] || null;
+}
+
+function ignoredControllers() {
+  const active = activeController();
+  return enabledControllers().filter((controller) => controller !== active);
 }
 
 function coveringControllers(node, controllers) {
   return controllers.filter((controller) => controllerCoversNode(controller, node));
 }
 
-function analyzeNode(node, controllers) {
+function samplerSubfolderInfo(node) {
+  const samplerSubfolder = String(widgetValue(node, "llps_subfolder", "") || "").trim();
+  if (samplerSubfolder) {
+    return { value: samplerSubfolder, source: "sampler llps_subfolder" };
+  }
+  const active = activeController();
+  const controllerSubfolder = String(widgetValue(active, "subfolder", "") || "").trim();
+  if (controllerSubfolder) {
+    return { value: controllerSubfolder, source: `Controller #${active.id} subfolder` };
+  }
+  return { value: `${node.type}_${node.id}`, source: "automatic sampler fallback" };
+}
+
+function analyzeNode(node, active, ignored) {
   if (isLLPSController(node)) {
     const enabled = isControllerEnabled(node);
+    if (enabled && active && node !== active) {
+      return {
+        status: "ignored",
+        detail: `ignored because LLPS Controller #${active.id} is active`,
+      };
+    }
     return {
       status: "llps",
-      detail: enabled ? "workflow controller / all sampler-like nodes" : "disabled workflow controller",
+      detail: enabled ? "active workflow controller / all sampler-like nodes" : "disabled workflow controller",
     };
   }
   if (isLLPSConfig(node)) {
     return { status: "legacy", detail: "deprecated v1.2 config compatibility node" };
   }
   if (isSamplerLike(node)) {
+    const controllers = active ? [active] : [];
     const coveredBy = coveringControllers(node, controllers);
+    const subfolder = samplerSubfolderInfo(node);
     if (coveredBy.length) {
       return {
         status: "controlled",
-        detail: `covered by LLPS Controller #${coveredBy[0].id}`,
+        detail: `covered by LLPS Controller #${coveredBy[0].id}; subfolder: ${subfolder.value} (${subfolder.source})${ignored.length ? `; ${ignored.length} Controller ignored` : ""}`,
         controlledBy: coveredBy.map((controller) => controller.id),
+        subfolder,
       };
     }
 
-    if (controllers.length) {
+    if (active || ignored.length) {
       return {
         status: "uncontrolled",
         detail: isLLPSSampler(node)
           ? "legacy LLPS KSampler outside active Controller coverage"
           : "sampler-like node outside active Controller coverage",
+        subfolder,
       };
     }
 
@@ -469,6 +567,7 @@ function analyzeNode(node, controllers) {
       detail: isLLPSSampler(node)
         ? "legacy LLPS KSampler; add/enable LLPS Controller for workflow control"
         : "sampler-like node; add/enable LLPS Controller for workflow control",
+      subfolder,
     };
   }
   if (LLPS_NODE_TYPES.has(node?.type)) {
@@ -487,6 +586,8 @@ function statusLabel(status) {
       return "candidate";
     case "llps":
       return "LLPS";
+    case "ignored":
+      return "ignored";
     case "legacy":
       return "legacy";
     default:
@@ -496,15 +597,16 @@ function statusLabel(status) {
 
 function scanWorkflow() {
   const nodes = Array.isArray(app.graph?._nodes) ? app.graph._nodes : [];
-  const controllers = activeControllers();
+  const active = activeController();
+  const ignored = ignoredControllers();
   lastScan = nodes
     .map((node) => {
-      const analysis = analyzeNode(node, controllers);
+      const analysis = analyzeNode(node, active, ignored);
       if (!analysis) {
         delete node.__llpsStatus;
         return null;
       }
-      const { status, detail, controlledBy } = analysis;
+      const { status, detail, controlledBy, subfolder } = analysis;
       node.__llpsStatus = status;
       return {
         id: node.id,
@@ -513,12 +615,13 @@ function scanWorkflow() {
         status,
         detail,
         controlledBy,
+        subfolder,
         node,
       };
     })
     .filter(Boolean)
     .sort((a, b) => {
-      const order = { controlled: 0, uncontrolled: 1, candidate: 2, llps: 3 };
+      const order = { controlled: 0, uncontrolled: 1, candidate: 2, llps: 3, ignored: 4, legacy: 5 };
       return (order[a.status] ?? 9) - (order[b.status] ?? 9) || Number(a.id) - Number(b.id);
     });
 
@@ -591,6 +694,13 @@ function renderPreviewStreams() {
   previews.replaceChildren();
   const streams = [...previewStreams.values()].sort((a, b) => Number(a.sampler_node_id || 0) - Number(b.sampler_node_id || 0));
   previews.classList.toggle("llps-has-streams", streams.length > 0);
+  if (!streams.length) {
+    const empty = document.createElement("div");
+    empty.className = "llps-empty";
+    empty.textContent = "No LLPS preview streams yet.";
+    previews.appendChild(empty);
+    return;
+  }
 
   for (const stream of streams) {
     const node = app.graph?.getNodeById?.(Number(stream.sampler_node_id));
@@ -655,6 +765,7 @@ function renderPreviewStreams() {
       createPreviewMeta("method", stream.method || stream.previewer_class),
       createPreviewMeta("status", stream.filename_resolution_status || (stream.save_also ? "saving" : "preview")),
       createPreviewMeta("subfolder", stream.effective_subfolder),
+      createPreviewMeta("source", stream.sampler_subfolder ? "sampler llps_subfolder" : (stream.controller_subfolder ? "controller subfolder" : "automatic fallback")),
       createPreviewMeta("last file", stream.last_saved_file)
     );
     card.appendChild(meta);
@@ -681,6 +792,7 @@ function renderFilters(counts) {
     ["uncontrolled", `Uncontrolled ${counts.uncontrolled}`],
     ["candidate", `Candidate ${counts.candidate}`],
     ["llps", `LLPS ${counts.llps}`],
+    ["ignored", `Ignored ${counts.ignored}`],
     ["legacy", `Legacy ${counts.legacy}`],
   ];
 
@@ -698,6 +810,29 @@ function renderFilters(counts) {
   }
 }
 
+function renderTabs() {
+  if (!tabs) {
+    return;
+  }
+  const streamCount = previewStreams.size;
+  const options = [
+    ["streams", `Streams ${streamCount}`],
+    ["nodes", `Nodes ${lastScan.length}`],
+  ];
+  tabs.replaceChildren();
+  for (const [tab, label] of options) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `llps-tab${activeManagerTab === tab ? " llps-active" : ""}`;
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      activeManagerTab = tab;
+      renderPanel();
+    });
+    tabs.appendChild(button);
+  }
+}
+
 function renderPanel() {
   if (!panel || !list || !summary) {
     return;
@@ -708,17 +843,24 @@ function renderPanel() {
       acc[item.status] = (acc[item.status] || 0) + 1;
       return acc;
     },
-    { controlled: 0, uncontrolled: 0, candidate: 0, llps: 0, legacy: 0 }
+    { controlled: 0, uncontrolled: 0, candidate: 0, llps: 0, ignored: 0, legacy: 0 }
   );
 
   summary.replaceChildren(
     createStat("controlled", counts.controlled),
     createStat("uncontrolled", counts.uncontrolled),
     createStat("candidate", counts.candidate),
-    createStat("LLPS nodes", counts.llps + counts.legacy)
+    createStat("LLPS nodes", counts.llps + counts.ignored + counts.legacy)
   );
+  renderTabs();
   renderFilters(counts);
   renderPreviewStreams();
+  if (previews) {
+    previews.hidden = activeManagerTab !== "streams";
+  }
+  if (nodesSection) {
+    nodesSection.hidden = activeManagerTab !== "nodes";
+  }
 
   list.replaceChildren();
   const visibleItems = filterItems();
@@ -749,6 +891,12 @@ function renderPanel() {
     detail.textContent = item.detail || statusLabel(item.status);
 
     text.append(title, meta, detail);
+    if (item.subfolder) {
+      const subfolder = document.createElement("div");
+      subfolder.className = "llps-node-meta";
+      subfolder.textContent = `subfolder: ${item.subfolder.value} (${item.subfolder.source})`;
+      text.appendChild(subfolder);
+    }
 
     const actions = document.createElement("div");
     const pill = document.createElement("span");
@@ -767,6 +915,47 @@ function renderPanel() {
     row.append(text, actions);
     list.appendChild(row);
   }
+}
+
+function enablePanelDrag(header) {
+  let dragging = null;
+  header.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.target.closest("button")) {
+      return;
+    }
+    const rect = panel.getBoundingClientRect();
+    dragging = {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    };
+    panel.style.left = `${rect.left}px`;
+    panel.style.top = `${rect.top}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+    header.setPointerCapture?.(event.pointerId);
+  });
+
+  header.addEventListener("pointermove", (event) => {
+    if (!dragging) {
+      return;
+    }
+    const width = panel.offsetWidth;
+    const height = panel.offsetHeight;
+    const left = Math.max(0, Math.min(window.innerWidth - width, event.clientX - dragging.x));
+    const top = Math.max(0, Math.min(window.innerHeight - height, event.clientY - dragging.y));
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+  });
+
+  const stop = (event) => {
+    if (!dragging) {
+      return;
+    }
+    dragging = null;
+    header.releasePointerCapture?.(event.pointerId);
+  };
+  header.addEventListener("pointerup", stop);
+  header.addEventListener("pointercancel", stop);
 }
 
 function createPanel() {
@@ -820,6 +1009,12 @@ function createPanel() {
   actions.append(selectUncontrolled, refresh, close);
   header.append(title, actions);
 
+  tabs = document.createElement("div");
+  tabs.className = "llps-panel-tabs";
+
+  nodesSection = document.createElement("div");
+  nodesSection.className = "llps-section";
+
   summary = document.createElement("div");
   summary.className = "llps-panel-summary";
 
@@ -832,8 +1027,10 @@ function createPanel() {
   list = document.createElement("div");
   list.className = "llps-node-list";
 
-  panel.append(header, summary, filters, previews, list);
+  nodesSection.append(summary, filters, list);
+  panel.append(header, tabs, previews, nodesSection);
   document.body.append(panel, toggleButton);
+  enablePanelDrag(header);
   scanWorkflow();
 }
 
@@ -850,7 +1047,9 @@ function drawBadge(ctx, node, status) {
         ? "#fb7185"
         : status === "candidate"
           ? "#fbbf24"
-          : "#60a5fa";
+          : status === "ignored"
+            ? "#94a3b8"
+            : "#60a5fa";
   const label = statusLabel(status);
 
   ctx.save();

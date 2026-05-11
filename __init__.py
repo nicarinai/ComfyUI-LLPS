@@ -14,8 +14,12 @@ import re
 import json
 import time
 import logging
+import base64
+import threading
 import urllib.error
 import urllib.request
+import uuid
+from io import BytesIO
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple
 
@@ -27,6 +31,7 @@ import comfy.sample
 import comfy.samplers
 import comfy.utils
 from comfy.cli_args import args
+from comfy_execution.utils import get_executing_context
 import folder_paths
 import latent_preview
 
@@ -40,6 +45,9 @@ TAESD_DECODER_URLS = {
     "taesd3_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taesd3_decoder.pth",
     "taef1_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taef1_decoder.pth",
 }
+LLPS_SAMPLER_TYPES = {"KSampler", "KSamplerAdvanced"}
+_LLPS_RUN_LOCK = threading.Lock()
+_LLPS_PREVIEW_RUNS: Dict[Tuple[str, str], list[Dict[str, Any]]] = {}
 
 
 def _sanitize_piece(text: str, fallback: str = "LLPS") -> str:
@@ -69,6 +77,7 @@ class LLPSConfigData:
     save_every_n_steps: int = 1
     save_metadata_json: bool = True
     jpeg_quality: int = 90
+    preview_max_side: int = 512
 
     @classmethod
     def from_obj(cls, obj: Optional[Dict[str, Any]]) -> "LLPSConfigData":
@@ -86,6 +95,7 @@ class LLPSConfigData:
         data.save_metadata_json = _bool(data.save_metadata_json)
         data.save_every_n_steps = max(1, int(data.save_every_n_steps or 1))
         data.jpeg_quality = max(1, min(100, int(data.jpeg_quality or 90)))
+        data.preview_max_side = 1024 if int(data.preview_max_side or 512) >= 1024 else 512
         data.live_preview_method = str(data.live_preview_method or "server_default")
         if data.live_preview_method == "default":
             data.live_preview_method = "server_default"
@@ -109,6 +119,7 @@ class LLPSControllerData:
     save_every_n_steps: int = 1
     save_metadata_json: bool = True
     jpeg_quality: int = 90
+    preview_max_side: int = 512
     controller_node_id: Optional[str] = None
 
     @classmethod
@@ -133,6 +144,7 @@ class LLPSControllerData:
             data.image_format = "jpg"
         data.save_every_n_steps = max(1, int(data.save_every_n_steps or 1))
         data.jpeg_quality = max(1, min(100, int(data.jpeg_quality or 90)))
+        data.preview_max_side = 1024 if int(data.preview_max_side or 512) >= 1024 else 512
         return data
 
     def to_legacy_config(self, show_preview: bool, save_preview: bool) -> LLPSConfigData:
@@ -149,6 +161,7 @@ class LLPSControllerData:
                 "save_every_n_steps": self.save_every_n_steps,
                 "save_metadata_json": self.save_metadata_json,
                 "jpeg_quality": self.jpeg_quality,
+                "preview_max_side": self.preview_max_side,
             }
         )
 
@@ -346,21 +359,28 @@ def _previewer_for_method_with_info(model, method: str, requested_method: Option
         args.preview_method = previous
 
 
-def _resolve_save_dir(cfg: LLPSConfigData, node_label: str) -> str:
+def _save_base_dir(cfg: LLPSConfigData) -> str:
     base = cfg.save_base_path.strip()
     if not base:
         base = os.path.join(folder_paths.get_output_directory(), "LLPS")
     # Relative paths are placed below ComfyUI output directory for safety/predictability.
     if not os.path.isabs(base):
         base = os.path.join(folder_paths.get_output_directory(), base)
+    return base
 
-    sub = _sanitize_piece(cfg.subfolder, "")
-    if sub:
-        base = os.path.join(base, sub)
-    else:
-        # For v1, separate the LLPS sampler output by node label automatically.
-        base = os.path.join(base, _sanitize_piece(node_label, "LLPS_KSampler"))
 
+def _effective_subfolder(cfg: LLPSConfigData, node_label: str, sampler_subfolder: Optional[str] = None) -> str:
+    per_sampler = _sanitize_piece(sampler_subfolder or "", "")
+    if per_sampler:
+        return per_sampler
+    controller_subfolder = _sanitize_piece(cfg.subfolder, "")
+    if controller_subfolder:
+        return controller_subfolder
+    return _sanitize_piece(node_label, "LLPS_KSampler")
+
+
+def _resolve_save_dir(cfg: LLPSConfigData, node_label: str, sampler_subfolder: Optional[str] = None) -> str:
+    base = os.path.join(_save_base_dir(cfg), _effective_subfolder(cfg, node_label, sampler_subfolder))
     os.makedirs(base, exist_ok=True)
     return base
 
@@ -375,6 +395,59 @@ def _previewer_for_method(model, method: str):
     return previewer
 
 
+def _normalize_preview_image(img: Image.Image, preview_max_side: int) -> Tuple[Image.Image, Dict[str, int]]:
+    original_width, original_height = img.size
+    max_side = 1024 if int(preview_max_side or 512) >= 1024 else 512
+    longest = max(original_width, original_height, 1)
+    scale = max_side / longest
+    target_width = max(1, int(round(original_width * scale)))
+    target_height = max(1, int(round(original_height * scale)))
+
+    if (target_width, target_height) == img.size:
+        out = img.copy()
+    else:
+        out = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    return out, {
+        "preview_max_side": max_side,
+        "preview_original_width": int(original_width),
+        "preview_original_height": int(original_height),
+        "preview_target_width": int(target_width),
+        "preview_target_height": int(target_height),
+    }
+
+
+def _normalize_preview_tuple(preview_tuple: Tuple[Any, ...], preview_max_side: int) -> Tuple[Optional[Tuple[Any, ...]], Dict[str, int]]:
+    if not preview_tuple or len(preview_tuple) < 2 or not isinstance(preview_tuple[1], Image.Image):
+        return None, {}
+    out, info = _normalize_preview_image(preview_tuple[1], preview_max_side)
+    image_type = preview_tuple[0] if len(preview_tuple) > 0 else "JPEG"
+    return (image_type, out, None), info
+
+
+def _preview_data_url(img: Image.Image, image_type: str = "JPEG", quality: int = 90) -> str:
+    pil_format = "PNG" if str(image_type).upper() == "PNG" else "JPEG"
+    out = img
+    if pil_format == "JPEG" and out.mode not in {"RGB", "L"}:
+        out = out.convert("RGB")
+    buffer = BytesIO()
+    kwargs = {"quality": quality} if pil_format == "JPEG" else {}
+    out.save(buffer, pil_format, **kwargs)
+    mime = "image/png" if pil_format == "PNG" else "image/jpeg"
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _send_llps_preview_event(payload: Dict[str, Any]) -> None:
+    try:
+        import server as comfy_server
+
+        instance = comfy_server.PromptServer.instance
+        instance.send_sync("llps_preview", payload, instance.client_id)
+    except Exception as e:
+        logging.debug("[LLPS] Could not send preview event: %s", e)
+
+
 def _save_preview_image(
     preview_tuple: Tuple[Any, ...],
     save_dir: str,
@@ -384,6 +457,8 @@ def _save_preview_image(
     total_steps: int,
     seed: int,
     method: str,
+    temp_run_id: Optional[str] = None,
+    sampler_node_id: Optional[str] = None,
 ) -> Optional[str]:
     if not preview_tuple or len(preview_tuple) < 2:
         return None
@@ -392,8 +467,8 @@ def _save_preview_image(
     if not isinstance(img, Image.Image):
         return None
 
-    max_res = preview_tuple[2] if len(preview_tuple) >= 3 else None
     out = img.copy()
+    max_res = preview_tuple[2] if len(preview_tuple) >= 3 else None
     if isinstance(max_res, int) and max_res > 0:
         out.thumbnail((max_res, max_res), Image.Resampling.LANCZOS)
 
@@ -401,7 +476,12 @@ def _save_preview_image(
     pil_format = {"jpg": "JPEG", "png": "PNG", "webp": "WEBP"}[ext]
     prefix = _sanitize_piece(cfg.filename_prefix, "LLPS")
     label = _sanitize_piece(node_label, "KSampler")
-    filename = f"{prefix}_{label}_seed-{int(seed)}_step-{step + 1:04d}-of-{int(total_steps):04d}_{method}.{ext}"
+    if temp_run_id:
+        node_part = _sanitize_piece(sampler_node_id or label, "node")
+        run_part = _sanitize_piece(temp_run_id, "run")
+        filename = f"tmp_{run_part}_n{node_part}_step{step + 1:04d}of{int(total_steps):04d}.{ext}"
+    else:
+        filename = f"{prefix}_{label}_step{step + 1:04d}of{int(total_steps):04d}_{method}.{ext}"
     path = os.path.join(save_dir, filename)
 
     save_kwargs = {}
@@ -414,6 +494,126 @@ def _save_preview_image(
 
     out.save(path, pil_format, **save_kwargs)
     return path
+
+
+def _unique_path(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    counter = 2
+    while True:
+        candidate = f"{root}_{counter}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+
+def _find_upstream_sampler_ids(prompt: Optional[Dict[str, Any]], node_id: Optional[str]) -> list[str]:
+    if not isinstance(prompt, dict) or node_id is None:
+        return []
+    found: list[str] = []
+    visited: set[str] = set()
+
+    def visit_value(value: Any) -> None:
+        if _is_prompt_link(value):
+            visit_node(str(value[0]))
+
+    def visit_node(current_id: str) -> None:
+        if current_id in visited:
+            return
+        visited.add(current_id)
+        node = prompt.get(current_id)
+        if not isinstance(node, dict):
+            return
+        if node.get("class_type") in LLPS_SAMPLER_TYPES:
+            found.append(current_id)
+        inputs = node.get("inputs", {})
+        if isinstance(inputs, dict):
+            for value in inputs.values():
+                if isinstance(value, list) and _is_prompt_link(value):
+                    visit_value(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        visit_value(item)
+
+    save_node = prompt.get(str(node_id))
+    if isinstance(save_node, dict):
+        inputs = save_node.get("inputs", {})
+        if isinstance(inputs, dict):
+            visit_value(inputs.get("images"))
+    return found
+
+
+def _rename_pending_previews_for_output(
+    prompt_id: Optional[str],
+    sampler_ids: list[str],
+    final_images: list[Dict[str, Any]],
+) -> None:
+    if not prompt_id or not sampler_ids or not final_images:
+        return
+    first_image = final_images[0]
+    final_filename = str(first_image.get("filename") or "")
+    final_basename = _sanitize_piece(os.path.splitext(os.path.basename(final_filename))[0], "")
+    if not final_basename:
+        return
+
+    with _LLPS_RUN_LOCK:
+        runs = []
+        for sampler_id in sampler_ids:
+            runs.extend(_LLPS_PREVIEW_RUNS.get((str(prompt_id), str(sampler_id)), []))
+
+    for run in runs:
+        if run.get("filename_resolution_status") == "renamed_to_final_image":
+            continue
+        metadata = run.get("metadata") if isinstance(run.get("metadata"), dict) else {}
+        prefix = _sanitize_piece(metadata.get("filename_prefix", "LLPS"), "LLPS")
+        renamed_files = []
+        for entry in run.get("saved_files", []):
+            old_path = entry.get("path")
+            if not old_path or not os.path.exists(old_path):
+                continue
+            ext = os.path.splitext(old_path)[1]
+            step = int(entry.get("step", 0)) + 1
+            total_steps = int(entry.get("total_steps", 0))
+            new_name = f"{prefix}_{final_basename}_step{step:04d}of{total_steps:04d}{ext}"
+            new_path = _unique_path(os.path.join(os.path.dirname(old_path), new_name))
+            try:
+                os.replace(old_path, new_path)
+            except OSError as e:
+                logging.warning("[LLPS] Could not rename preview %s to %s: %s", old_path, new_path, e)
+                continue
+            entry["path"] = new_path
+            entry["filename"] = os.path.basename(new_path)
+            renamed_files.append(os.path.basename(new_path))
+
+        if renamed_files:
+            run["renamed_files"] = renamed_files
+            run["filename_resolution_status"] = "renamed_to_final_image"
+            if isinstance(metadata, dict):
+                metadata["filename_resolution_status"] = "renamed_to_final_image"
+                metadata["final_output"] = first_image
+                metadata["saved_files"] = renamed_files
+                metadata["renamed_files"] = renamed_files
+                metadata["renamed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                metadata_path = run.get("metadata_path")
+                if metadata_path:
+                    try:
+                        _write_metadata_json(os.path.dirname(metadata_path), metadata, os.path.basename(metadata_path))
+                    except OSError as e:
+                        logging.warning("[LLPS] Could not update renamed preview metadata: %s", e)
+            _send_llps_preview_event(
+                {
+                    "controller_node_id": run.get("controller_node_id"),
+                    "sampler_node_id": run.get("sampler_node_id"),
+                    "sampler_node_type": run.get("sampler_node_type"),
+                    "sampler_label": run.get("node_label"),
+                    "prompt_id": str(prompt_id),
+                    "run_id": run.get("run_id"),
+                    "filename_resolution_status": "renamed_to_final_image",
+                    "final_output": first_image,
+                    "last_saved_file": renamed_files[-1],
+                }
+            )
 
 
 def _make_llps_callback(model, steps: int, cfg: LLPSConfigData, node_label: str, seed: int):
@@ -443,6 +643,7 @@ def _make_llps_callback(model, steps: int, cfg: LLPSConfigData, node_label: str,
                 # result_samples may already be in the final latent-output space, which can produce
                 # oversaturated / CFG-burnt looking TAESD previews.
                 preview_tuple = previewer.decode_latent_to_preview_image(preview_format_for_comfy, x0)
+                preview_tuple, _resolution_info = _normalize_preview_tuple(preview_tuple, cfg.preview_max_side)
                 callback.llps_last_preview_tuple = preview_tuple
                 callback.llps_last_callback_step = int(step)
             except Exception as e:
@@ -576,6 +777,7 @@ def _active_controller_from_prompt(prompt: Optional[Dict[str, Any]]) -> Optional
                 "save_every_n_steps": _prompt_int(prompt, inputs.get("save_every_n_steps", 1), 1),
                 "save_metadata_json": _prompt_bool(prompt, inputs.get("save_metadata_json", True), True),
                 "jpeg_quality": _prompt_int(prompt, inputs.get("jpeg_quality", 90), 90),
+                "preview_max_side": _prompt_int(prompt, inputs.get("preview_max_side", 512), 512),
                 "controller_node_id": str(node_id),
             }
         )
@@ -584,8 +786,8 @@ def _active_controller_from_prompt(prompt: Optional[Dict[str, Any]]) -> Optional
     return None
 
 
-def _write_metadata_json(save_dir: str, metadata: Dict[str, Any]) -> None:
-    with open(os.path.join(save_dir, "metadata.json"), "w", encoding="utf-8") as f:
+def _write_metadata_json(save_dir: str, metadata: Dict[str, Any], filename: str = "metadata.json") -> None:
+    with open(os.path.join(save_dir, filename), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 
@@ -595,6 +797,9 @@ def _make_controller_callback(
     controller: LLPSControllerData,
     node_label: str,
     seed: int,
+    sampler_node_id: Optional[str],
+    sampler_node_type: str,
+    sampler_subfolder: Optional[str] = None,
 ):
     method = controller.live_preview_method
     show_preview = controller.enabled and method not in {"none", "disabled"}
@@ -605,29 +810,77 @@ def _make_controller_callback(
     else:
         previewer, previewer_info = _previewer_for_method_with_info(model, "none", method)
     cfg = controller.to_legacy_config(show_preview=show_preview, save_preview=save_preview)
+    prompt_context = get_executing_context()
+    prompt_id = prompt_context.prompt_id if prompt_context is not None else "unknown_prompt"
+    run_id = uuid.uuid4().hex[:10]
+    effective_subfolder = _effective_subfolder(cfg, node_label, sampler_subfolder)
 
     save_dir = None
     saved_files = []
+    saved_file_entries = []
     if save_preview:
-        save_dir = _resolve_save_dir(cfg, node_label)
+        save_dir = _resolve_save_dir(cfg, node_label, sampler_subfolder)
 
     pbar = comfy.utils.ProgressBar(steps, node_id=controller.controller_node_id)
     preview_format_for_comfy = "JPEG"
+    run_record = {
+        "prompt_id": str(prompt_id),
+        "run_id": run_id,
+        "controller_node_id": controller.controller_node_id,
+        "sampler_node_id": str(sampler_node_id) if sampler_node_id is not None else None,
+        "sampler_node_type": sampler_node_type,
+        "node_label": node_label,
+        "save_dir": save_dir,
+        "saved_files": saved_file_entries,
+        "renamed_files": [],
+        "metadata_path": None,
+        "metadata": None,
+        "filename_resolution_status": "pending_final_image" if save_preview else "not_saving",
+    }
+    if save_preview and sampler_node_id is not None:
+        with _LLPS_RUN_LOCK:
+            _LLPS_PREVIEW_RUNS.setdefault((str(prompt_id), str(sampler_node_id)), []).append(run_record)
 
     def callback(step, x0, x, total_steps):
         preview_tuple = None
+        resolution_info = {}
         if previewer is not None:
             try:
                 preview_tuple = previewer.decode_latent_to_preview_image(preview_format_for_comfy, x0)
+                preview_tuple, resolution_info = _normalize_preview_tuple(preview_tuple, cfg.preview_max_side)
                 callback.llps_last_preview_tuple = preview_tuple
-                if len(preview_tuple) > 1:
+                callback.llps_last_preview_resolution = resolution_info
+                if preview_tuple is not None and len(preview_tuple) > 1:
                     callback.llps_last_preview_image_id = id(preview_tuple[1])
                 callback.llps_last_callback_step = int(step)
             except Exception as e:
                 logging.exception("[LLPS] Controller failed to decode preview at step %s: %s", step, e)
 
         if show_preview and preview_tuple is not None:
-            pbar.update_absolute(step + 1, total_steps, preview_tuple)
+            pbar.update_absolute(step + 1, total_steps, None)
+            _send_llps_preview_event(
+                {
+                    "controller_node_id": controller.controller_node_id,
+                    "sampler_node_id": str(sampler_node_id) if sampler_node_id is not None else None,
+                    "sampler_node_type": sampler_node_type,
+                    "sampler_label": node_label,
+                    "prompt_id": str(prompt_id),
+                    "run_id": run_id,
+                    "step": int(step) + 1,
+                    "total_steps": int(total_steps),
+                    "method": callback.llps_source_method,
+                    "previewer_class": previewer_info.get("actual_previewer_class"),
+                    "fallback_reason": previewer_info.get("fallback_reason"),
+                    "save_also": bool(save_preview),
+                    "save_base_path": _save_base_dir(cfg),
+                    "controller_subfolder": cfg.subfolder,
+                    "sampler_subfolder": sampler_subfolder or "",
+                    "effective_subfolder": effective_subfolder,
+                    "last_saved_file": os.path.basename(saved_files[-1]) if saved_files else None,
+                    "image": _preview_data_url(preview_tuple[1], preview_tuple[0], cfg.jpeg_quality),
+                    **resolution_info,
+                }
+            )
         else:
             pbar.update_absolute(step + 1, total_steps, None)
 
@@ -644,9 +897,19 @@ def _make_controller_callback(
                         int(total_steps),
                         int(seed),
                         source_method,
+                        temp_run_id=run_id,
+                        sampler_node_id=str(sampler_node_id) if sampler_node_id is not None else None,
                     )
                     if saved:
                         saved_files.append(saved)
+                        saved_file_entries.append(
+                            {
+                                "path": saved,
+                                "filename": os.path.basename(saved),
+                                "step": int(adjusted_step),
+                                "total_steps": int(total_steps),
+                            }
+                        )
                 except Exception as e:
                     logging.exception("[LLPS] Controller failed to save preview at step %s: %s", step, e)
 
@@ -656,14 +919,23 @@ def _make_controller_callback(
     callback.llps_controller = controller
     callback.llps_source_method = source_method
     callback.llps_previewer_info = previewer_info
+    callback.llps_run_record = run_record
+    callback.llps_run_id = run_id
+    callback.llps_prompt_id = str(prompt_id)
+    callback.llps_sampler_node_id = str(sampler_node_id) if sampler_node_id is not None else None
+    callback.llps_sampler_node_type = sampler_node_type
+    callback.llps_sampler_subfolder = sampler_subfolder or ""
+    callback.llps_effective_subfolder = effective_subfolder
     callback.llps_last_preview_tuple = None
     callback.llps_last_preview_image_id = None
     callback.llps_last_callback_step = None
+    callback.llps_last_preview_resolution = {}
 
     logging.info(
-        "[LLPS] Controller sampler previewer: controller=%s sampler=%s requested=%s source=%s resolved=%s class=%s module=%s fallback=%s",
+        "[LLPS] Controller sampler previewer: controller=%s sampler=%s run=%s requested=%s source=%s resolved=%s class=%s module=%s fallback=%s",
         controller.controller_node_id,
         node_label,
+        run_id,
         previewer_info.get("requested_live_preview_method"),
         previewer_info.get("requested_preview_source_method"),
         previewer_info.get("resolved_preview_source_method"),
@@ -675,6 +947,8 @@ def _make_controller_callback(
 
 
 _ORIGINAL_COMMON_KSAMPLER = comfy_nodes.common_ksampler
+_ORIGINAL_SAVE_IMAGE_INPUTS = comfy_nodes.SaveImage.INPUT_TYPES
+_ORIGINAL_SAVE_IMAGE_SAVE_IMAGES = comfy_nodes.SaveImage.save_images
 
 
 def _llps_common_ksampler(
@@ -694,6 +968,7 @@ def _llps_common_ksampler(
     force_full_denoise=False,
     prompt=None,
     unique_id=None,
+    llps_subfolder="",
 ):
     controller = _active_controller_from_prompt(prompt)
     if controller is None:
@@ -728,7 +1003,16 @@ def _llps_common_ksampler(
     if isinstance(prompt, dict) and unique_id is not None:
         node_type = prompt.get(str(unique_id), {}).get("class_type", node_type)
     node_label = f"{node_type}_{unique_id or 'node'}"
-    callback = _make_controller_callback(model, int(steps), controller, node_label, int(seed))
+    callback = _make_controller_callback(
+        model,
+        int(steps),
+        controller,
+        node_label,
+        int(seed),
+        str(unique_id) if unique_id is not None else None,
+        node_type,
+        llps_subfolder,
+    )
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
     samples = comfy.sample.sample(
@@ -767,9 +1051,19 @@ def _llps_common_ksampler(
                 int(steps),
                 int(seed),
                 callback.llps_source_method,
+                temp_run_id=callback.llps_run_id,
+                sampler_node_id=callback.llps_sampler_node_id,
             )
             if saved:
                 callback.llps_saved_files.append(saved)
+                callback.llps_run_record["saved_files"].append(
+                    {
+                        "path": saved,
+                        "filename": os.path.basename(saved),
+                        "step": int(steps) - 1,
+                        "total_steps": int(steps),
+                    }
+                )
         except Exception as e:
             logging.exception("[LLPS] Controller failed to flush final preview image: %s", e)
 
@@ -777,27 +1071,45 @@ def _llps_common_ksampler(
         try:
             previewer_info = dict(callback.llps_previewer_info)
             previewer_info["last_preview_image_id"] = callback.llps_last_preview_image_id
+            resolution_info = dict(callback.llps_last_preview_resolution or {})
+            metadata_filename = f"metadata_{callback.llps_run_id}.json"
+            metadata = {
+                "node": "LLPS Controller",
+                "prompt_id": callback.llps_prompt_id,
+                "run_id": callback.llps_run_id,
+                "controller_node_id": controller.controller_node_id,
+                "sampler_node_id": str(unique_id) if unique_id is not None else None,
+                "sampler_node_type": node_type,
+                "seed": int(seed),
+                "steps": int(steps),
+                "cfg": float(cfg),
+                "sampler_name": sampler_name,
+                "scheduler": scheduler,
+                "denoise": float(denoise),
+                "live_preview_method": controller.live_preview_method,
+                "preview_source_method": callback.llps_source_method,
+                "previewer_info": previewer_info,
+                "save_also": bool(controller.save_also),
+                "filename_prefix": callback.llps_config.filename_prefix,
+                "save_base_path": _save_base_dir(callback.llps_config),
+                "controller_subfolder": callback.llps_config.subfolder,
+                "sampler_subfolder": callback.llps_sampler_subfolder,
+                "effective_subfolder": callback.llps_effective_subfolder,
+                "save_dir": callback.llps_save_dir,
+                "filename_resolution_status": callback.llps_run_record.get("filename_resolution_status"),
+                "final_output": None,
+                "saved_count": len(callback.llps_saved_files),
+                "saved_files": [os.path.basename(p) for p in callback.llps_saved_files],
+                "renamed_files": [],
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **resolution_info,
+            }
+            callback.llps_run_record["metadata"] = metadata
+            callback.llps_run_record["metadata_path"] = os.path.join(callback.llps_save_dir, metadata_filename)
             _write_metadata_json(
                 callback.llps_save_dir,
-                {
-                    "node": "LLPS Controller",
-                    "controller_node_id": controller.controller_node_id,
-                    "sampler_node_id": str(unique_id) if unique_id is not None else None,
-                    "sampler_node_type": node_type,
-                    "seed": int(seed),
-                    "steps": int(steps),
-                    "cfg": float(cfg),
-                    "sampler_name": sampler_name,
-                    "scheduler": scheduler,
-                    "denoise": float(denoise),
-                    "live_preview_method": controller.live_preview_method,
-                    "preview_source_method": callback.llps_source_method,
-                    "previewer_info": previewer_info,
-                    "save_also": bool(controller.save_also),
-                    "saved_count": len(callback.llps_saved_files),
-                    "saved_files": [os.path.basename(p) for p in callback.llps_saved_files],
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                },
+                metadata,
+                metadata_filename,
             )
         except Exception as e:
             logging.exception("[LLPS] Controller failed to write metadata.json: %s", e)
@@ -813,8 +1125,23 @@ def _with_llps_hidden(input_types: Dict[str, Any]) -> Dict[str, Any]:
     for section in ("required", "optional", "hidden"):
         if section in patched:
             patched[section] = dict(patched[section])
+    optional = patched.setdefault("optional", {})
+    optional.setdefault(
+        "llps_subfolder",
+        ("STRING", {"default": "", "multiline": False, "tooltip": "Optional LLPS per-sampler preview save subfolder."}),
+    )
     hidden = patched.setdefault("hidden", {})
     hidden["prompt"] = "PROMPT"
+    hidden["unique_id"] = "UNIQUE_ID"
+    return patched
+
+
+def _with_save_image_unique_id(input_types: Dict[str, Any]) -> Dict[str, Any]:
+    patched = dict(input_types)
+    for section in ("required", "optional", "hidden"):
+        if section in patched:
+            patched[section] = dict(patched[section])
+    hidden = patched.setdefault("hidden", {})
     hidden["unique_id"] = "UNIQUE_ID"
     return patched
 
@@ -834,7 +1161,7 @@ def _patch_builtin_samplers() -> None:
     def advanced_input_types(cls):
         return _with_llps_hidden(original_advanced_inputs())
 
-    def ksampler_sample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0, prompt=None, unique_id=None):
+    def ksampler_sample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0, llps_subfolder="", prompt=None, unique_id=None):
         return _llps_common_ksampler(
             model,
             seed,
@@ -848,6 +1175,7 @@ def _patch_builtin_samplers() -> None:
             denoise=denoise,
             prompt=prompt,
             unique_id=unique_id,
+            llps_subfolder=llps_subfolder,
         )
 
     def advanced_sample(
@@ -866,6 +1194,7 @@ def _patch_builtin_samplers() -> None:
         end_at_step,
         return_with_leftover_noise,
         denoise=1.0,
+        llps_subfolder="",
         prompt=None,
         unique_id=None,
     ):
@@ -888,6 +1217,7 @@ def _patch_builtin_samplers() -> None:
             force_full_denoise=force_full_denoise,
             prompt=prompt,
             unique_id=unique_id,
+            llps_subfolder=llps_subfolder,
         )
 
     comfy_nodes.KSampler.INPUT_TYPES = ksampler_input_types
@@ -896,6 +1226,23 @@ def _patch_builtin_samplers() -> None:
     comfy_nodes.KSamplerAdvanced.sample = advanced_sample
     comfy_nodes.KSampler._llps_controller_patch = True
     comfy_nodes.KSamplerAdvanced._llps_controller_patch = True
+
+    @classmethod
+    def save_image_input_types(cls):
+        return _with_save_image_unique_id(_ORIGINAL_SAVE_IMAGE_INPUTS())
+
+    def save_images(self, images, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None, unique_id=None):
+        result = _ORIGINAL_SAVE_IMAGE_SAVE_IMAGES(self, images, filename_prefix, prompt, extra_pnginfo)
+        if getattr(self, "type", "output") == "output" and isinstance(result, dict):
+            output_images = result.get("ui", {}).get("images", [])
+            context = get_executing_context()
+            prompt_id = context.prompt_id if context is not None else None
+            sampler_ids = _find_upstream_sampler_ids(prompt, str(unique_id) if unique_id is not None else None)
+            _rename_pending_previews_for_output(prompt_id, sampler_ids, output_images)
+        return result
+
+    comfy_nodes.SaveImage.INPUT_TYPES = save_image_input_types
+    comfy_nodes.SaveImage.save_images = save_images
 
 
 _patch_builtin_samplers()
@@ -918,6 +1265,7 @@ class LLPSConfig:
                 "save_every_n_steps": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
                 "save_metadata_json": ("BOOLEAN", {"default": True}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
+                "preview_max_side": ([512, 1024], {"default": 512}),
             }
         }
 
@@ -939,6 +1287,7 @@ class LLPSConfig:
         save_every_n_steps=1,
         save_metadata_json=True,
         jpeg_quality=90,
+        preview_max_side=512,
     ):
         cfg = LLPSConfigData(
             enabled=enabled,
@@ -952,6 +1301,7 @@ class LLPSConfig:
             save_every_n_steps=save_every_n_steps,
             save_metadata_json=save_metadata_json,
             jpeg_quality=jpeg_quality,
+            preview_max_side=preview_max_side,
         )
         return (asdict(LLPSConfigData.from_obj(asdict(cfg))),)
 
@@ -971,6 +1321,7 @@ class LLPSController:
                 "save_every_n_steps": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
                 "save_metadata_json": ("BOOLEAN", {"default": True}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
+                "preview_max_side": ([512, 1024], {"default": 512}),
             }
         }
 
@@ -991,6 +1342,7 @@ class LLPSController:
         save_every_n_steps=1,
         save_metadata_json=True,
         jpeg_quality=90,
+        preview_max_side=512,
     ):
         cfg = LLPSConfigData(
             enabled=enabled,
@@ -1004,6 +1356,7 @@ class LLPSController:
             save_every_n_steps=save_every_n_steps,
             save_metadata_json=save_metadata_json,
             jpeg_quality=jpeg_quality,
+            preview_max_side=preview_max_side,
         )
         controller = asdict(LLPSConfigData.from_obj(asdict(cfg)))
         controller["node"] = "LLPS Controller"

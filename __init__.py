@@ -144,6 +144,91 @@ class LLPSControllerData:
         )
 
 
+def _preview_method_value(method: Any) -> str:
+    if hasattr(method, "value"):
+        return str(method.value)
+    return str(method)
+
+
+def _previewer_identity(previewer: Any) -> Dict[str, Any]:
+    if previewer is None:
+        return {
+            "actual_previewer_class": None,
+            "actual_previewer_module": None,
+            "actual_previewer_id": None,
+        }
+    return {
+        "actual_previewer_class": previewer.__class__.__name__,
+        "actual_previewer_module": previewer.__class__.__module__,
+        "actual_previewer_id": id(previewer),
+    }
+
+
+def _previewer_fallback_reason(requested_method: str, resolved_method: str, previewer: Any) -> Optional[str]:
+    requested = str(requested_method or "server_default")
+    resolved = str(resolved_method or "none")
+    cls_name = previewer.__class__.__name__ if previewer is not None else None
+
+    if previewer is None:
+        if requested in {"none", "disabled"} or resolved == "none":
+            return "preview_disabled"
+        return "previewer_unavailable"
+    if requested == "server_default":
+        return "server_default_used"
+    if requested == "auto":
+        return "auto_resolved_by_comfy"
+    if requested == "taesd" and cls_name not in {"TAESDPreviewerImpl", "TAEHVPreviewerImpl"}:
+        return "taesd_requested_but_taesd_previewer_unavailable_or_fell_back"
+    if requested == "latent2rgb" and cls_name != "Latent2RGBPreviewer":
+        return "latent2rgb_requested_but_different_previewer_returned"
+    return None
+
+
+def _previewer_for_method_with_info(model, method: str, requested_method: Optional[str] = None):
+    requested = str(requested_method or method or "server_default")
+    source = str(method or "server_default")
+    previous = args.preview_method
+    previous_method = _preview_method_value(previous)
+    info = {
+        "requested_live_preview_method": requested,
+        "requested_preview_source_method": source,
+        "previous_global_preview_method": previous_method,
+        "resolved_preview_source_method": None,
+        "actual_previewer_class": None,
+        "actual_previewer_module": None,
+        "actual_previewer_id": None,
+        "fallback_reason": None,
+        "latent_format_class": None,
+        "latent_format_module": None,
+        "taesd_decoder_name": None,
+        "latent_rgb_factors_available": None,
+    }
+
+    latent_format = getattr(getattr(model, "model", None), "latent_format", None)
+    if latent_format is not None:
+        info["latent_format_class"] = latent_format.__class__.__name__
+        info["latent_format_module"] = latent_format.__class__.__module__
+        info["taesd_decoder_name"] = getattr(latent_format, "taesd_decoder_name", None)
+        info["latent_rgb_factors_available"] = getattr(latent_format, "latent_rgb_factors", None) is not None
+
+    if source in {"none", "disabled"}:
+        info["resolved_preview_source_method"] = "none"
+        info["fallback_reason"] = _previewer_fallback_reason(requested, "none", None)
+        return None, info
+
+    try:
+        if source not in {"server_default", "default", ""}:
+            latent_preview.set_preview_method(source)
+        resolved = _preview_method_value(args.preview_method)
+        previewer = latent_preview.get_previewer(model.load_device, model.model.latent_format)
+        info.update(_previewer_identity(previewer))
+        info["resolved_preview_source_method"] = resolved
+        info["fallback_reason"] = _previewer_fallback_reason(requested, resolved, previewer)
+        return previewer, info
+    finally:
+        args.preview_method = previous
+
+
 def _resolve_save_dir(cfg: LLPSConfigData, node_label: str) -> str:
     base = cfg.save_base_path.strip()
     if not base:
@@ -169,17 +254,8 @@ def _previewer_for_method(model, method: str):
     ComfyUI's latent_preview.get_previewer currently reads args.preview_method. v1 therefore
     changes it only while constructing the previewer, not during the whole sample.
     """
-    if method in {"none", "disabled"}:
-        return None
-
-    previous = args.preview_method
-    try:
-        if method not in {"server_default", "default", ""}:
-            latent_preview.set_preview_method(method)
-        # server_default/default: keep current server setting.
-        return latent_preview.get_previewer(model.load_device, model.model.latent_format)
-    finally:
-        args.preview_method = previous
+    previewer, _info = _previewer_for_method_with_info(model, method, method)
+    return previewer
 
 
 def _save_preview_image(
@@ -407,7 +483,10 @@ def _make_controller_callback(
     show_preview = controller.enabled and method not in {"none", "disabled"}
     save_preview = controller.enabled and controller.save_also
     source_method = method if show_preview else "server_default"
-    previewer = _previewer_for_method(model, source_method) if (show_preview or save_preview) else None
+    if show_preview or save_preview:
+        previewer, previewer_info = _previewer_for_method_with_info(model, source_method, method)
+    else:
+        previewer, previewer_info = _previewer_for_method_with_info(model, "none", method)
     cfg = controller.to_legacy_config(show_preview=show_preview, save_preview=save_preview)
 
     save_dir = None
@@ -424,6 +503,8 @@ def _make_controller_callback(
             try:
                 preview_tuple = previewer.decode_latent_to_preview_image(preview_format_for_comfy, x0)
                 callback.llps_last_preview_tuple = preview_tuple
+                if len(preview_tuple) > 1:
+                    callback.llps_last_preview_image_id = id(preview_tuple[1])
                 callback.llps_last_callback_step = int(step)
             except Exception as e:
                 logging.exception("[LLPS] Controller failed to decode preview at step %s: %s", step, e)
@@ -457,8 +538,22 @@ def _make_controller_callback(
     callback.llps_config = cfg
     callback.llps_controller = controller
     callback.llps_source_method = source_method
+    callback.llps_previewer_info = previewer_info
     callback.llps_last_preview_tuple = None
+    callback.llps_last_preview_image_id = None
     callback.llps_last_callback_step = None
+
+    logging.info(
+        "[LLPS] Controller sampler previewer: controller=%s sampler=%s requested=%s source=%s resolved=%s class=%s module=%s fallback=%s",
+        controller.controller_node_id,
+        node_label,
+        previewer_info.get("requested_live_preview_method"),
+        previewer_info.get("requested_preview_source_method"),
+        previewer_info.get("resolved_preview_source_method"),
+        previewer_info.get("actual_previewer_class"),
+        previewer_info.get("actual_previewer_module"),
+        previewer_info.get("fallback_reason"),
+    )
     return callback
 
 
@@ -563,6 +658,8 @@ def _llps_common_ksampler(
 
     if controller.save_also and callback.llps_config.save_metadata_json and callback.llps_save_dir:
         try:
+            previewer_info = dict(callback.llps_previewer_info)
+            previewer_info["last_preview_image_id"] = callback.llps_last_preview_image_id
             _write_metadata_json(
                 callback.llps_save_dir,
                 {
@@ -578,6 +675,7 @@ def _llps_common_ksampler(
                     "denoise": float(denoise),
                     "live_preview_method": controller.live_preview_method,
                     "preview_source_method": callback.llps_source_method,
+                    "previewer_info": previewer_info,
                     "save_also": bool(controller.save_also),
                     "saved_count": len(callback.llps_saved_files),
                     "saved_files": [os.path.basename(p) for p in callback.llps_saved_files],

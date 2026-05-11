@@ -14,6 +14,8 @@ import re
 import json
 import time
 import logging
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple
 
@@ -31,6 +33,13 @@ import latent_preview
 
 LLPS_CATEGORY = "LLPS/Live Latent Preview"
 LLPS_LEGACY_CATEGORY = "LLPS/Legacy v1.2"
+TAESD_PREVIEWER_CLASSES = {"TAESDPreviewerImpl", "TAEHVPreviewerImpl"}
+TAESD_DECODER_URLS = {
+    "taesd_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taesd_decoder.pth",
+    "taesdxl_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taesdxl_decoder.pth",
+    "taesd3_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taesd3_decoder.pth",
+    "taef1_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taef1_decoder.pth",
+}
 
 
 def _sanitize_piece(text: str, fallback: str = "LLPS") -> str:
@@ -164,6 +173,10 @@ def _previewer_identity(previewer: Any) -> Dict[str, Any]:
     }
 
 
+def _is_taesd_previewer(previewer: Any) -> bool:
+    return previewer is not None and previewer.__class__.__name__ in TAESD_PREVIEWER_CLASSES
+
+
 def _previewer_fallback_reason(requested_method: str, resolved_method: str, previewer: Any) -> Optional[str]:
     requested = str(requested_method or "server_default")
     resolved = str(resolved_method or "none")
@@ -177,11 +190,104 @@ def _previewer_fallback_reason(requested_method: str, resolved_method: str, prev
         return "server_default_used"
     if requested == "auto":
         return "auto_resolved_by_comfy"
-    if requested == "taesd" and cls_name not in {"TAESDPreviewerImpl", "TAEHVPreviewerImpl"}:
+    if requested == "taesd" and cls_name not in TAESD_PREVIEWER_CLASSES:
         return "taesd_requested_but_taesd_previewer_unavailable_or_fell_back"
     if requested == "latent2rgb" and cls_name != "Latent2RGBPreviewer":
         return "latent2rgb_requested_but_different_previewer_returned"
     return None
+
+
+def _taesd_decoder_candidates(decoder_name: Optional[str]) -> list[str]:
+    if not decoder_name:
+        return []
+    try:
+        if hasattr(folder_paths, "get_filename_list_"):
+            filenames = folder_paths.get_filename_list_("vae_approx")[0]
+        else:
+            filenames = folder_paths.get_filename_list("vae_approx")
+        return [
+            filename
+            for filename in filenames
+            if filename.startswith(decoder_name)
+        ]
+    except Exception as e:
+        logging.warning("[LLPS] Could not list TAESD decoder candidates for %s: %s", decoder_name, e)
+        return []
+
+
+def _refresh_vae_approx_cache() -> None:
+    try:
+        folder_paths.filename_list_cache.pop("vae_approx", None)
+    except Exception:
+        pass
+    try:
+        folder_paths.cache_helper.clear()
+    except Exception:
+        pass
+
+
+def _ensure_taesd_decoder_available(decoder_name: Optional[str]) -> Dict[str, Any]:
+    result = {
+        "attempted": False,
+        "success": False,
+        "decoder_name": decoder_name,
+        "url": None,
+        "path": None,
+        "error": None,
+    }
+    if not decoder_name:
+        result["error"] = "latent_format_has_no_taesd_decoder_name"
+        return result
+
+    candidates = _taesd_decoder_candidates(decoder_name)
+    if candidates:
+        result["success"] = True
+        result["path"] = folder_paths.get_full_path("vae_approx", candidates[0])
+        return result
+
+    url = TAESD_DECODER_URLS.get(decoder_name)
+    result["url"] = url
+    if not url:
+        result["error"] = "no_known_download_url_for_decoder"
+        return result
+
+    folders = folder_paths.get_folder_paths("vae_approx")
+    if not folders:
+        result["error"] = "vae_approx_folder_not_registered"
+        return result
+
+    target_dir = folders[0]
+    target_path = os.path.join(target_dir, f"{decoder_name}.pth")
+    result["path"] = target_path
+    result["attempted"] = True
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        logging.info("[LLPS] Downloading missing TAESD decoder %s to %s", decoder_name, target_path)
+        request = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-LLPS/2"})
+        tmp_path = f"{target_path}.part"
+        with urllib.request.urlopen(request, timeout=60) as response, open(tmp_path, "wb") as f:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        if os.path.getsize(tmp_path) <= 0:
+            raise RuntimeError("downloaded decoder file is empty")
+        os.replace(tmp_path, target_path)
+        _refresh_vae_approx_cache()
+        folder_paths.get_filename_list("vae_approx")
+        result["success"] = True
+    except (OSError, urllib.error.URLError, RuntimeError) as e:
+        result["error"] = str(e)
+        try:
+            if os.path.exists(f"{target_path}.part"):
+                os.remove(f"{target_path}.part")
+        except OSError:
+            pass
+        logging.warning("[LLPS] Could not install TAESD decoder %s: %s", decoder_name, e)
+
+    return result
 
 
 def _previewer_for_method_with_info(model, method: str, requested_method: Optional[str] = None):
@@ -201,6 +307,8 @@ def _previewer_for_method_with_info(model, method: str, requested_method: Option
         "latent_format_class": None,
         "latent_format_module": None,
         "taesd_decoder_name": None,
+        "taesd_decoder_candidates": [],
+        "taesd_decoder_install": None,
         "latent_rgb_factors_available": None,
     }
 
@@ -209,6 +317,7 @@ def _previewer_for_method_with_info(model, method: str, requested_method: Option
         info["latent_format_class"] = latent_format.__class__.__name__
         info["latent_format_module"] = latent_format.__class__.__module__
         info["taesd_decoder_name"] = getattr(latent_format, "taesd_decoder_name", None)
+        info["taesd_decoder_candidates"] = _taesd_decoder_candidates(info["taesd_decoder_name"])
         info["latent_rgb_factors_available"] = getattr(latent_format, "latent_rgb_factors", None) is not None
 
     if source in {"none", "disabled"}:
@@ -224,6 +333,14 @@ def _previewer_for_method_with_info(model, method: str, requested_method: Option
         info.update(_previewer_identity(previewer))
         info["resolved_preview_source_method"] = resolved
         info["fallback_reason"] = _previewer_fallback_reason(requested, resolved, previewer)
+        if source == "taesd" and not _is_taesd_previewer(previewer):
+            install_info = _ensure_taesd_decoder_available(info["taesd_decoder_name"])
+            info["taesd_decoder_install"] = install_info
+            info["taesd_decoder_candidates"] = _taesd_decoder_candidates(info["taesd_decoder_name"])
+            if install_info.get("success"):
+                previewer = latent_preview.get_previewer(model.load_device, model.model.latent_format)
+                info.update(_previewer_identity(previewer))
+                info["fallback_reason"] = _previewer_fallback_reason(requested, resolved, previewer)
         return previewer, info
     finally:
         args.preview_method = previous

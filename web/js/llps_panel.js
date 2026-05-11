@@ -321,28 +321,16 @@ function isControllerEnabled(controller) {
   return widgetValue(controller, "enabled", true) === true;
 }
 
-function controllerScope(controller) {
-  return String(widgetValue(controller, "scope", "all_sampler_like") || "all_sampler_like");
-}
-
 function controllerCoversNode(controller, node) {
   if (!controller || !isControllerEnabled(controller)) {
     return false;
-  }
-
-  const scope = controllerScope(controller);
-  if (scope === "none") {
-    return false;
-  }
-  if (scope === "legacy_llps_only") {
-    return isLLPSSampler(node);
   }
   return isSamplerLike(node);
 }
 
 function activeControllers() {
   const nodes = Array.isArray(app.graph?._nodes) ? app.graph._nodes : [];
-  return nodes.filter((node) => isLLPSController(node) && isControllerEnabled(node) && controllerScope(node) !== "none");
+  return nodes.filter((node) => isLLPSController(node) && isControllerEnabled(node));
 }
 
 function coveringControllers(node, controllers) {
@@ -352,10 +340,9 @@ function coveringControllers(node, controllers) {
 function analyzeNode(node, controllers) {
   if (isLLPSController(node)) {
     const enabled = isControllerEnabled(node);
-    const scope = controllerScope(node);
     return {
       status: "llps",
-      detail: `${enabled ? "workflow controller" : "disabled controller"} / scope: ${scope}`,
+      detail: enabled ? "workflow controller / all sampler-like nodes" : "disabled workflow controller",
     };
   }
   if (isLLPSConfig(node)) {
@@ -375,8 +362,8 @@ function analyzeNode(node, controllers) {
       return {
         status: "uncontrolled",
         detail: isLLPSSampler(node)
-          ? "legacy LLPS KSampler outside current Controller scope"
-          : "sampler-like node outside current Controller scope",
+          ? "legacy LLPS KSampler outside active Controller coverage"
+          : "sampler-like node outside active Controller coverage",
       };
     }
 

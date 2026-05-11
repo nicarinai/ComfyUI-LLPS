@@ -299,7 +299,6 @@ class LLPSController:
         return {
             "required": {
                 "enabled": ("BOOLEAN", {"default": True}),
-                "scope": (["all_sampler_like", "legacy_llps_only", "none"], {"default": "all_sampler_like"}),
                 "live_preview_method": (["server_default", "none", "auto", "latent2rgb", "taesd"], {"default": "latent2rgb"}),
                 "show_preview": ("BOOLEAN", {"default": True}),
                 "save_preview": ("BOOLEAN", {"default": False}),
@@ -313,15 +312,13 @@ class LLPSController:
             }
         }
 
-    RETURN_TYPES = ("LLPS_CONTROLLER",)
-    RETURN_NAMES = ("llps_controller",)
+    RETURN_TYPES = ()
     FUNCTION = "make_controller"
     CATEGORY = LLPS_CATEGORY
 
     def make_controller(
         self,
         enabled=True,
-        scope="all_sampler_like",
         live_preview_method="latent2rgb",
         show_preview=True,
         save_preview=False,
@@ -347,9 +344,8 @@ class LLPSController:
             jpeg_quality=jpeg_quality,
         )
         controller = asdict(LLPSConfigData.from_obj(asdict(cfg)))
-        controller["scope"] = str(scope or "all_sampler_like")
         controller["node"] = "LLPS Controller"
-        return (controller,)
+        return ()
 
 
 class LLPSKSampler:

@@ -5,7 +5,7 @@ LLPS = **LiveLatentPreviewer & Saver**.
 This v2-alpha provides three nodes and a manager panel:
 
 - **LLPS Config**: choose live preview method, show/save toggles, save path, filename, image format, interval.
-- **LLPS Controller**: workflow-level declaration for LLPS preview management scope.
+- **LLPS Controller**: workflow-level declaration for LLPS preview management.
 - **LLPS KSampler**: legacy/prototype KSampler-compatible node that uses `LLPS_CONFIG` for callback-based preview saving.
 - **LLPS Manager panel**: frontend workflow scanner for sampler-like nodes and LLPS-controlled status.
 
@@ -30,7 +30,7 @@ Restart ComfyUI.
 1. Add `LLPS Controller`.
 2. Open the **LLPS Manager** panel.
 3. Use **Refresh** to scan sampler-like nodes in the workflow.
-4. Use the panel to inspect which nodes are covered by the Controller scope.
+4. Use the panel to inspect which sampler-like nodes are covered by the enabled Controller.
 
 For legacy v1.2 preview saving, `LLPS Config` can still be connected to `LLPS KSampler`.
 

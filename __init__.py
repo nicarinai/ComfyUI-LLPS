@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from PIL import Image
 
+import nodes as comfy_nodes
 import comfy.sample
 import comfy.samplers
 import comfy.utils
@@ -85,6 +86,62 @@ class LLPSConfigData:
         if data.image_format not in {"jpg", "png", "webp"}:
             data.image_format = "jpg"
         return data
+
+
+@dataclass
+class LLPSControllerData:
+    enabled: bool = True
+    live_preview_method: str = "latent2rgb"
+    save_also: bool = False
+    save_base_path: str = ""
+    subfolder: str = ""
+    filename_prefix: str = "LLPS"
+    image_format: str = "jpg"
+    save_every_n_steps: int = 1
+    save_metadata_json: bool = True
+    jpeg_quality: int = 90
+    controller_node_id: Optional[str] = None
+
+    @classmethod
+    def from_obj(cls, obj: Optional[Dict[str, Any]]) -> "LLPSControllerData":
+        if isinstance(obj, cls):
+            return obj
+        if not isinstance(obj, dict):
+            return cls()
+        data = cls()
+        for key in asdict(data).keys():
+            if key in obj:
+                setattr(data, key, obj[key])
+        data.enabled = _bool(data.enabled)
+        data.save_also = _bool(data.save_also)
+        data.live_preview_method = str(data.live_preview_method or "server_default")
+        if data.live_preview_method == "default":
+            data.live_preview_method = "server_default"
+        data.image_format = str(data.image_format or "jpg").lower()
+        if data.image_format == "jpeg":
+            data.image_format = "jpg"
+        if data.image_format not in {"jpg", "png", "webp"}:
+            data.image_format = "jpg"
+        data.save_every_n_steps = max(1, int(data.save_every_n_steps or 1))
+        data.jpeg_quality = max(1, min(100, int(data.jpeg_quality or 90)))
+        return data
+
+    def to_legacy_config(self, show_preview: bool, save_preview: bool) -> LLPSConfigData:
+        return LLPSConfigData.from_obj(
+            {
+                "enabled": self.enabled,
+                "live_preview_method": self.live_preview_method,
+                "show_preview": show_preview,
+                "save_preview": save_preview,
+                "save_base_path": self.save_base_path,
+                "subfolder": self.subfolder,
+                "filename_prefix": self.filename_prefix,
+                "image_format": self.image_format,
+                "save_every_n_steps": self.save_every_n_steps,
+                "save_metadata_json": self.save_metadata_json,
+                "jpeg_quality": self.jpeg_quality,
+            }
+        )
 
 
 def _resolve_save_dir(cfg: LLPSConfigData, node_label: str) -> str:
@@ -238,6 +295,397 @@ def _make_llps_callback(model, steps: int, cfg: LLPSConfigData, node_label: str,
     return callback
 
 
+def _is_prompt_link(value: Any) -> bool:
+    return isinstance(value, list) and len(value) == 2 and isinstance(value[0], str)
+
+
+def _resolve_prompt_value(prompt: Dict[str, Any], value: Any, seen: Optional[set] = None) -> Any:
+    if not _is_prompt_link(value):
+        return value
+
+    if seen is None:
+        seen = set()
+    node_id = str(value[0])
+    if node_id in seen:
+        return value
+    seen.add(node_id)
+
+    node = prompt.get(node_id)
+    if not isinstance(node, dict):
+        return value
+    inputs = node.get("inputs", {})
+    if not isinstance(inputs, dict):
+        return value
+
+    for key in ("value", "boolean", "bool", "enabled", "save_also", "save_preview"):
+        if key in inputs:
+            return _resolve_prompt_value(prompt, inputs[key], seen)
+
+    literal_values = [v for v in inputs.values() if not _is_prompt_link(v)]
+    bool_values = [v for v in literal_values if isinstance(v, bool)]
+    if len(bool_values) == 1:
+        return bool_values[0]
+    if len(literal_values) == 1:
+        return literal_values[0]
+    return value
+
+
+def _prompt_bool(prompt: Dict[str, Any], value: Any, default: bool = False) -> bool:
+    resolved = _resolve_prompt_value(prompt, value)
+    if _is_prompt_link(resolved) or resolved is None:
+        return default
+    return _bool(resolved)
+
+
+def _prompt_text(prompt: Dict[str, Any], value: Any, default: str = "") -> str:
+    resolved = _resolve_prompt_value(prompt, value)
+    if _is_prompt_link(resolved) or resolved is None:
+        return default
+    return str(resolved)
+
+
+def _prompt_int(prompt: Dict[str, Any], value: Any, default: int) -> int:
+    resolved = _resolve_prompt_value(prompt, value)
+    if _is_prompt_link(resolved) or resolved is None:
+        return default
+    try:
+        return int(resolved)
+    except Exception:
+        return default
+
+
+def _active_controller_from_prompt(prompt: Optional[Dict[str, Any]]) -> Optional[LLPSControllerData]:
+    if not isinstance(prompt, dict):
+        return None
+
+    for node_id in sorted(prompt.keys(), key=lambda x: str(x)):
+        node = prompt.get(node_id)
+        if not isinstance(node, dict) or node.get("class_type") != "LLPSController":
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+
+        enabled = _prompt_bool(prompt, inputs.get("enabled", True), True)
+        if not enabled:
+            continue
+
+        save_also_value = inputs.get("save_also", inputs.get("save_preview", False))
+        controller = LLPSControllerData.from_obj(
+            {
+                "enabled": enabled,
+                "live_preview_method": _prompt_text(prompt, inputs.get("live_preview_method", "latent2rgb"), "latent2rgb"),
+                "save_also": _prompt_bool(prompt, save_also_value, False),
+                "save_base_path": _prompt_text(prompt, inputs.get("save_base_path", ""), ""),
+                "subfolder": _prompt_text(prompt, inputs.get("subfolder", ""), ""),
+                "filename_prefix": _prompt_text(prompt, inputs.get("filename_prefix", "LLPS"), "LLPS"),
+                "image_format": _prompt_text(prompt, inputs.get("image_format", "jpg"), "jpg"),
+                "save_every_n_steps": _prompt_int(prompt, inputs.get("save_every_n_steps", 1), 1),
+                "save_metadata_json": _prompt_bool(prompt, inputs.get("save_metadata_json", True), True),
+                "jpeg_quality": _prompt_int(prompt, inputs.get("jpeg_quality", 90), 90),
+                "controller_node_id": str(node_id),
+            }
+        )
+        return controller
+
+    return None
+
+
+def _write_metadata_json(save_dir: str, metadata: Dict[str, Any]) -> None:
+    with open(os.path.join(save_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def _make_controller_callback(
+    model,
+    steps: int,
+    controller: LLPSControllerData,
+    node_label: str,
+    seed: int,
+):
+    method = controller.live_preview_method
+    show_preview = controller.enabled and method not in {"none", "disabled"}
+    save_preview = controller.enabled and controller.save_also
+    source_method = method if show_preview else "server_default"
+    previewer = _previewer_for_method(model, source_method) if (show_preview or save_preview) else None
+    cfg = controller.to_legacy_config(show_preview=show_preview, save_preview=save_preview)
+
+    save_dir = None
+    saved_files = []
+    if save_preview:
+        save_dir = _resolve_save_dir(cfg, node_label)
+
+    pbar = comfy.utils.ProgressBar(steps, node_id=controller.controller_node_id)
+    preview_format_for_comfy = "JPEG"
+
+    def callback(step, x0, x, total_steps):
+        preview_tuple = None
+        if previewer is not None:
+            try:
+                preview_tuple = previewer.decode_latent_to_preview_image(preview_format_for_comfy, x0)
+                callback.llps_last_preview_tuple = preview_tuple
+                callback.llps_last_callback_step = int(step)
+            except Exception as e:
+                logging.exception("[LLPS] Controller failed to decode preview at step %s: %s", step, e)
+
+        if show_preview and preview_tuple is not None:
+            pbar.update_absolute(step + 1, total_steps, preview_tuple)
+        else:
+            pbar.update_absolute(step + 1, total_steps, None)
+
+        if save_preview and preview_tuple is not None and step > 0:
+            adjusted_step = step - 1
+            if (adjusted_step % cfg.save_every_n_steps) == 0:
+                try:
+                    saved = _save_preview_image(
+                        preview_tuple,
+                        save_dir,
+                        cfg,
+                        node_label,
+                        int(adjusted_step),
+                        int(total_steps),
+                        int(seed),
+                        source_method,
+                    )
+                    if saved:
+                        saved_files.append(saved)
+                except Exception as e:
+                    logging.exception("[LLPS] Controller failed to save preview at step %s: %s", step, e)
+
+    callback.llps_saved_files = saved_files
+    callback.llps_save_dir = save_dir
+    callback.llps_config = cfg
+    callback.llps_controller = controller
+    callback.llps_source_method = source_method
+    callback.llps_last_preview_tuple = None
+    callback.llps_last_callback_step = None
+    return callback
+
+
+_ORIGINAL_COMMON_KSAMPLER = comfy_nodes.common_ksampler
+
+
+def _llps_common_ksampler(
+    model,
+    seed,
+    steps,
+    cfg,
+    sampler_name,
+    scheduler,
+    positive,
+    negative,
+    latent,
+    denoise=1.0,
+    disable_noise=False,
+    start_step=None,
+    last_step=None,
+    force_full_denoise=False,
+    prompt=None,
+    unique_id=None,
+):
+    controller = _active_controller_from_prompt(prompt)
+    if controller is None:
+        return _ORIGINAL_COMMON_KSAMPLER(
+            model,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent,
+            denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_step,
+            last_step=last_step,
+            force_full_denoise=force_full_denoise,
+        )
+
+    latent_image = latent["samples"]
+    latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image, latent.get("downscale_ratio_spacial", None))
+
+    if disable_noise:
+        noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+    else:
+        batch_inds = latent["batch_index"] if "batch_index" in latent else None
+        noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+
+    noise_mask = latent.get("noise_mask", None)
+    node_type = "KSampler"
+    if isinstance(prompt, dict) and unique_id is not None:
+        node_type = prompt.get(str(unique_id), {}).get("class_type", node_type)
+    node_label = f"{node_type}_{unique_id or 'node'}"
+    callback = _make_controller_callback(model, int(steps), controller, node_label, int(seed))
+    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+    samples = comfy.sample.sample(
+        model,
+        noise,
+        int(steps),
+        float(cfg),
+        sampler_name,
+        scheduler,
+        positive,
+        negative,
+        latent_image,
+        denoise=float(denoise),
+        disable_noise=disable_noise,
+        start_step=start_step,
+        last_step=last_step,
+        force_full_denoise=force_full_denoise,
+        noise_mask=noise_mask,
+        callback=callback,
+        disable_pbar=disable_pbar,
+        seed=int(seed),
+    )
+
+    if (
+        controller.save_also
+        and callback.llps_save_dir
+        and callback.llps_last_preview_tuple is not None
+    ):
+        try:
+            saved = _save_preview_image(
+                callback.llps_last_preview_tuple,
+                callback.llps_save_dir,
+                callback.llps_config,
+                node_label,
+                int(steps) - 1,
+                int(steps),
+                int(seed),
+                callback.llps_source_method,
+            )
+            if saved:
+                callback.llps_saved_files.append(saved)
+        except Exception as e:
+            logging.exception("[LLPS] Controller failed to flush final preview image: %s", e)
+
+    if controller.save_also and callback.llps_config.save_metadata_json and callback.llps_save_dir:
+        try:
+            _write_metadata_json(
+                callback.llps_save_dir,
+                {
+                    "node": "LLPS Controller",
+                    "controller_node_id": controller.controller_node_id,
+                    "sampler_node_id": str(unique_id) if unique_id is not None else None,
+                    "sampler_node_type": node_type,
+                    "seed": int(seed),
+                    "steps": int(steps),
+                    "cfg": float(cfg),
+                    "sampler_name": sampler_name,
+                    "scheduler": scheduler,
+                    "denoise": float(denoise),
+                    "live_preview_method": controller.live_preview_method,
+                    "preview_source_method": callback.llps_source_method,
+                    "save_also": bool(controller.save_also),
+                    "saved_count": len(callback.llps_saved_files),
+                    "saved_files": [os.path.basename(p) for p in callback.llps_saved_files],
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+        except Exception as e:
+            logging.exception("[LLPS] Controller failed to write metadata.json: %s", e)
+
+    out = latent.copy()
+    out.pop("downscale_ratio_spacial", None)
+    out["samples"] = samples
+    return (out,)
+
+
+def _with_llps_hidden(input_types: Dict[str, Any]) -> Dict[str, Any]:
+    patched = dict(input_types)
+    for section in ("required", "optional", "hidden"):
+        if section in patched:
+            patched[section] = dict(patched[section])
+    hidden = patched.setdefault("hidden", {})
+    hidden["prompt"] = "PROMPT"
+    hidden["unique_id"] = "UNIQUE_ID"
+    return patched
+
+
+def _patch_builtin_samplers() -> None:
+    if getattr(comfy_nodes.KSampler, "_llps_controller_patch", False):
+        return
+
+    original_ksampler_inputs = comfy_nodes.KSampler.INPUT_TYPES
+    original_advanced_inputs = comfy_nodes.KSamplerAdvanced.INPUT_TYPES
+
+    @classmethod
+    def ksampler_input_types(cls):
+        return _with_llps_hidden(original_ksampler_inputs())
+
+    @classmethod
+    def advanced_input_types(cls):
+        return _with_llps_hidden(original_advanced_inputs())
+
+    def ksampler_sample(self, model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=1.0, prompt=None, unique_id=None):
+        return _llps_common_ksampler(
+            model,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent_image,
+            denoise=denoise,
+            prompt=prompt,
+            unique_id=unique_id,
+        )
+
+    def advanced_sample(
+        self,
+        model,
+        add_noise,
+        noise_seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        positive,
+        negative,
+        latent_image,
+        start_at_step,
+        end_at_step,
+        return_with_leftover_noise,
+        denoise=1.0,
+        prompt=None,
+        unique_id=None,
+    ):
+        force_full_denoise = return_with_leftover_noise != "enable"
+        disable_noise = add_noise == "disable"
+        return _llps_common_ksampler(
+            model,
+            noise_seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent_image,
+            denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_at_step,
+            last_step=end_at_step,
+            force_full_denoise=force_full_denoise,
+            prompt=prompt,
+            unique_id=unique_id,
+        )
+
+    comfy_nodes.KSampler.INPUT_TYPES = ksampler_input_types
+    comfy_nodes.KSampler.sample = ksampler_sample
+    comfy_nodes.KSamplerAdvanced.INPUT_TYPES = advanced_input_types
+    comfy_nodes.KSamplerAdvanced.sample = advanced_sample
+    comfy_nodes.KSampler._llps_controller_patch = True
+    comfy_nodes.KSamplerAdvanced._llps_controller_patch = True
+
+
+_patch_builtin_samplers()
+
+
 
 class LLPSConfig:
     @classmethod
@@ -300,8 +748,7 @@ class LLPSController:
             "required": {
                 "enabled": ("BOOLEAN", {"default": True}),
                 "live_preview_method": (["server_default", "none", "auto", "latent2rgb", "taesd"], {"default": "latent2rgb"}),
-                "show_preview": ("BOOLEAN", {"default": True}),
-                "save_preview": ("BOOLEAN", {"default": False}),
+                "save_also": ("BOOLEAN", {"default": False}),
                 "save_base_path": ("STRING", {"default": "", "multiline": False}),
                 "subfolder": ("STRING", {"default": "", "multiline": False}),
                 "filename_prefix": ("STRING", {"default": "LLPS", "multiline": False}),
@@ -313,6 +760,7 @@ class LLPSController:
         }
 
     RETURN_TYPES = ()
+    OUTPUT_NODE = True
     FUNCTION = "make_controller"
     CATEGORY = LLPS_CATEGORY
 
@@ -320,8 +768,7 @@ class LLPSController:
         self,
         enabled=True,
         live_preview_method="latent2rgb",
-        show_preview=True,
-        save_preview=False,
+        save_also=False,
         save_base_path="",
         subfolder="",
         filename_prefix="LLPS",
@@ -333,8 +780,8 @@ class LLPSController:
         cfg = LLPSConfigData(
             enabled=enabled,
             live_preview_method=live_preview_method,
-            show_preview=show_preview,
-            save_preview=save_preview,
+            show_preview=live_preview_method not in {"none", "disabled"},
+            save_preview=save_also,
             save_base_path=save_base_path,
             subfolder=subfolder,
             filename_prefix=filename_prefix,

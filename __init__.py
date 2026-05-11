@@ -1265,7 +1265,7 @@ class LLPSConfig:
                 "save_every_n_steps": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
                 "save_metadata_json": ("BOOLEAN", {"default": True}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
-                "preview_max_side": ([512, 1024], {"default": 512}),
+                "preview_max_side": (["512", "1024"], {"default": "512"}),
             }
         }
 
@@ -1321,7 +1321,7 @@ class LLPSController:
                 "save_every_n_steps": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1}),
                 "save_metadata_json": ("BOOLEAN", {"default": True}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 1, "max": 100, "step": 1}),
-                "preview_max_side": ([512, 1024], {"default": 512}),
+                "preview_max_side": (["512", "1024"], {"default": "512"}),
             }
         }
 

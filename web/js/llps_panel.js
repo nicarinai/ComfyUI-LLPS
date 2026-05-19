@@ -24,7 +24,7 @@ const SAMPLER_WIDGET_NAMES = new Set([
   "denoise",
 ]);
 
-const LLPS_NODE_TYPES = new Set(["LLPSController", "LLPSConfig"]);
+const LLPS_NODE_TYPES = new Set(["LLPSController", "LLPSStreamController", "LLPSConfig"]);
 
 let panel;
 let list;
@@ -462,6 +462,10 @@ function isLLPSController(node) {
   return node?.type === "LLPSController";
 }
 
+function isLLPSStreamController(node) {
+  return node?.type === "LLPSStreamController";
+}
+
 function isLLPSSampler(node) {
   return node?.type === "LLPSKSampler";
 }
@@ -505,11 +509,35 @@ function ignoredControllers() {
   return enabledControllers().filter((controller) => controller !== active);
 }
 
+function streamControllers() {
+  const nodes = Array.isArray(app.graph?._nodes) ? app.graph._nodes : [];
+  return nodes.filter(isLLPSStreamController).sort((a, b) => nodeSortValue(a) - nodeSortValue(b));
+}
+
+function streamControllerForSampler(node) {
+  if (!node) {
+    return null;
+  }
+  const target = String(node.id);
+  return streamControllers().find((controller) => String(widgetValue(controller, "target_sampler_id", "") || "").trim() === target) || null;
+}
+
 function coveringControllers(node, controllers) {
   return controllers.filter((controller) => controllerCoversNode(controller, node));
 }
 
 function samplerSubfolderInfo(node) {
+  const streamController = streamControllerForSampler(node);
+  if (
+    streamController &&
+    widgetValue(streamController, "enabled", true) === true &&
+    widgetValue(streamController, "override_subfolder", false) === true
+  ) {
+    const value = String(widgetValue(streamController, "subfolder", "") || "").trim();
+    if (value) {
+      return { value, source: `Stream Controller #${streamController.id} subfolder` };
+    }
+  }
   const samplerSubfolder = String(widgetValue(node, "llps_subfolder", "") || "").trim();
   if (samplerSubfolder) {
     return { value: samplerSubfolder, source: "sampler llps_subfolder" };
@@ -536,17 +564,36 @@ function analyzeNode(node, active, ignored) {
       detail: enabled ? "active workflow controller / all sampler-like nodes" : "disabled workflow controller",
     };
   }
+  if (isLLPSStreamController(node)) {
+    const enabled = widgetValue(node, "enabled", true) === true;
+    const target = String(widgetValue(node, "target_sampler_id", "") || "").trim();
+    return {
+      status: "llps",
+      detail: enabled
+        ? `stream controller${target ? ` for sampler #${target}` : " without target sampler"}`
+        : `disabled stream controller${target ? ` for sampler #${target}` : ""}`,
+    };
+  }
   if (isLLPSConfig(node)) {
     return { status: "legacy", detail: "deprecated v1.2 config compatibility node" };
   }
   if (isSamplerLike(node)) {
     const controllers = active ? [active] : [];
     const coveredBy = coveringControllers(node, controllers);
+    const streamController = streamControllerForSampler(node);
     const subfolder = samplerSubfolderInfo(node);
+    if (streamController && widgetValue(streamController, "enabled", true) !== true) {
+      return {
+        status: "uncontrolled",
+        detail: `excluded by disabled Stream Controller #${streamController.id}`,
+        subfolder,
+      };
+    }
     if (coveredBy.length) {
+      const streamDetail = streamController ? `; stream settings from #${streamController.id}` : "";
       return {
         status: "controlled",
-        detail: `covered by LLPS Controller #${coveredBy[0].id}; subfolder: ${subfolder.value} (${subfolder.source})${ignored.length ? `; ${ignored.length} Controller ignored` : ""}`,
+        detail: `covered by LLPS Controller #${coveredBy[0].id}${streamDetail}; subfolder: ${subfolder.value} (${subfolder.source})${ignored.length ? `; ${ignored.length} Controller ignored` : ""}`,
         controlledBy: coveredBy.map((controller) => controller.id),
         subfolder,
       };
@@ -765,7 +812,7 @@ function renderPreviewStreams() {
       createPreviewMeta("method", stream.method || stream.previewer_class),
       createPreviewMeta("status", stream.filename_resolution_status || (stream.save_also ? "saving" : "preview")),
       createPreviewMeta("subfolder", stream.effective_subfolder),
-      createPreviewMeta("source", stream.sampler_subfolder ? "sampler llps_subfolder" : (stream.controller_subfolder ? "controller subfolder" : "automatic fallback")),
+      createPreviewMeta("source", stream.subfolder_source || (stream.sampler_subfolder ? "sampler llps_subfolder" : (stream.controller_subfolder ? "controller subfolder" : "automatic fallback"))),
       createPreviewMeta("last file", stream.last_saved_file)
     );
     card.appendChild(meta);

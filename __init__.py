@@ -169,6 +169,40 @@ class LLPSControllerData:
         )
 
 
+@dataclass
+class LLPSStreamControllerData:
+    enabled: bool = True
+    target_sampler_id: str = ""
+    override_save_also: bool = False
+    save_also: bool = False
+    override_subfolder: bool = False
+    subfolder: str = ""
+    override_filename_prefix: bool = False
+    filename_prefix: str = ""
+    stream_controller_node_id: Optional[str] = None
+
+    @classmethod
+    def from_obj(cls, obj: Optional[Dict[str, Any]]) -> "LLPSStreamControllerData":
+        if isinstance(obj, cls):
+            return obj
+        if not isinstance(obj, dict):
+            return cls()
+        data = cls()
+        for key in asdict(data).keys():
+            if key in obj:
+                setattr(data, key, obj[key])
+        data.enabled = _bool(data.enabled)
+        data.target_sampler_id = str(data.target_sampler_id or "").strip()
+        data.override_save_also = _bool(data.override_save_also)
+        data.save_also = _bool(data.save_also)
+        data.override_subfolder = _bool(data.override_subfolder)
+        data.subfolder = str(data.subfolder or "").strip()
+        data.override_filename_prefix = _bool(data.override_filename_prefix)
+        data.filename_prefix = str(data.filename_prefix or "").strip()
+        data.stream_controller_node_id = str(data.stream_controller_node_id) if data.stream_controller_node_id is not None else None
+        return data
+
+
 def _preview_method_value(method: Any) -> str:
     if hasattr(method, "value"):
         return str(method.value)
@@ -612,6 +646,8 @@ def _rename_pending_previews_for_output(
                     "sampler_label": run.get("node_label"),
                     "prompt_id": str(prompt_id),
                     "run_id": run.get("run_id"),
+                    "stream_controller_node_id": run.get("stream_controller_node_id"),
+                    "stream_overrides": run.get("stream_overrides", {}),
                     "filename_resolution_status": "renamed_to_final_image",
                     "final_output": first_image,
                     "last_saved_file": renamed_files[-1],
@@ -806,6 +842,87 @@ def _active_controller_from_prompt(prompt: Optional[Dict[str, Any]]) -> Optional
     return None
 
 
+def _stream_controller_from_prompt(
+    prompt: Optional[Dict[str, Any]],
+    sampler_node_id: Optional[str],
+) -> Optional[LLPSStreamControllerData]:
+    if not isinstance(prompt, dict) or sampler_node_id is None:
+        return None
+
+    matches = []
+    for node_id in sorted(prompt.keys(), key=_prompt_node_sort_key):
+        node = prompt.get(node_id)
+        if not isinstance(node, dict) or node.get("class_type") != "LLPSStreamController":
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        target_sampler_id = _prompt_text(prompt, inputs.get("target_sampler_id", ""), "")
+        if str(target_sampler_id).strip() != str(sampler_node_id):
+            continue
+        matches.append(
+            LLPSStreamControllerData.from_obj(
+                {
+                    "enabled": _prompt_bool(prompt, inputs.get("enabled", True), True),
+                    "target_sampler_id": target_sampler_id,
+                    "override_save_also": _prompt_bool(prompt, inputs.get("override_save_also", False), False),
+                    "save_also": _prompt_bool(prompt, inputs.get("save_also", False), False),
+                    "override_subfolder": _prompt_bool(prompt, inputs.get("override_subfolder", False), False),
+                    "subfolder": _prompt_text(prompt, inputs.get("subfolder", ""), ""),
+                    "override_filename_prefix": _prompt_bool(prompt, inputs.get("override_filename_prefix", False), False),
+                    "filename_prefix": _prompt_text(prompt, inputs.get("filename_prefix", ""), ""),
+                    "stream_controller_node_id": str(node_id),
+                }
+            )
+        )
+
+    if matches:
+        if len(matches) > 1:
+            logging.info(
+                "[LLPS] Multiple Stream Controllers target sampler #%s; using #%s and ignoring %s",
+                sampler_node_id,
+                matches[0].stream_controller_node_id,
+                [item.stream_controller_node_id for item in matches[1:]],
+            )
+        return matches[0]
+
+    return None
+
+
+def _controller_with_stream_overrides(
+    controller: LLPSControllerData,
+    stream: Optional[LLPSStreamControllerData],
+) -> Tuple[LLPSControllerData, Dict[str, Any]]:
+    effective = LLPSControllerData.from_obj(asdict(controller))
+    info = {
+        "stream_controller_node_id": None,
+        "stream_enabled": True,
+        "stream_overrides": {},
+        "save_also_source": "global_controller",
+        "subfolder_source": None,
+        "filename_prefix_source": "global_controller",
+        "stream_subfolder": None,
+    }
+    if stream is None:
+        return effective, info
+
+    info["stream_controller_node_id"] = stream.stream_controller_node_id
+    info["stream_enabled"] = bool(stream.enabled)
+    if stream.override_save_also:
+        effective.save_also = bool(stream.save_also)
+        info["stream_overrides"]["save_also"] = bool(stream.save_also)
+        info["save_also_source"] = f"Stream Controller #{stream.stream_controller_node_id}"
+    if stream.override_filename_prefix and stream.filename_prefix:
+        effective.filename_prefix = stream.filename_prefix
+        info["stream_overrides"]["filename_prefix"] = stream.filename_prefix
+        info["filename_prefix_source"] = f"Stream Controller #{stream.stream_controller_node_id}"
+    if stream.override_subfolder and stream.subfolder:
+        info["stream_overrides"]["subfolder"] = stream.subfolder
+        info["subfolder_source"] = f"Stream Controller #{stream.stream_controller_node_id}"
+        info["stream_subfolder"] = stream.subfolder
+    return effective, info
+
+
 def _write_metadata_json(save_dir: str, metadata: Dict[str, Any], filename: str = "metadata.json") -> None:
     with open(os.path.join(save_dir, filename), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -821,6 +938,7 @@ def _make_controller_callback(
     sampler_node_type: str,
     sampler_subfolder: Optional[str] = None,
     x0_output_dict: Optional[Dict[str, Any]] = None,
+    stream_info: Optional[Dict[str, Any]] = None,
 ):
     method = controller.live_preview_method
     show_preview = controller.enabled and method not in {"none", "disabled"}
@@ -835,6 +953,14 @@ def _make_controller_callback(
     prompt_id = prompt_context.prompt_id if prompt_context is not None else "unknown_prompt"
     run_id = uuid.uuid4().hex[:10]
     effective_subfolder = _effective_subfolder(cfg, node_label, sampler_subfolder)
+    stream_info = dict(stream_info or {})
+    if not stream_info.get("subfolder_source"):
+        if sampler_subfolder:
+            stream_info["subfolder_source"] = "sampler_llps_subfolder"
+        elif cfg.subfolder:
+            stream_info["subfolder_source"] = "global_controller"
+        else:
+            stream_info["subfolder_source"] = "automatic_sampler_fallback"
 
     save_dir = None
     saved_files = []
@@ -857,6 +983,8 @@ def _make_controller_callback(
         "metadata_path": None,
         "metadata": None,
         "filename_resolution_status": "pending_final_image" if save_preview else "not_saving",
+        "stream_controller_node_id": stream_info.get("stream_controller_node_id"),
+        "stream_overrides": stream_info.get("stream_overrides", {}),
     }
     if save_preview and sampler_node_id is not None:
         with _LLPS_RUN_LOCK:
@@ -900,6 +1028,11 @@ def _make_controller_callback(
                     "controller_subfolder": cfg.subfolder,
                     "sampler_subfolder": sampler_subfolder or "",
                     "effective_subfolder": effective_subfolder,
+                    "subfolder_source": stream_info.get("subfolder_source"),
+                    "stream_controller_node_id": stream_info.get("stream_controller_node_id"),
+                    "stream_overrides": stream_info.get("stream_overrides", {}),
+                    "save_also_source": stream_info.get("save_also_source", "global_controller"),
+                    "filename_prefix_source": stream_info.get("filename_prefix_source", "global_controller"),
                     "last_saved_file": os.path.basename(saved_files[-1]) if saved_files else None,
                     "image": _preview_data_url(preview_tuple[1], preview_tuple[0], cfg.jpeg_quality),
                     **resolution_info,
@@ -950,6 +1083,11 @@ def _make_controller_callback(
     callback.llps_sampler_node_type = sampler_node_type
     callback.llps_sampler_subfolder = sampler_subfolder or ""
     callback.llps_effective_subfolder = effective_subfolder
+    callback.llps_stream_controller_node_id = stream_info.get("stream_controller_node_id")
+    callback.llps_stream_overrides = stream_info.get("stream_overrides", {})
+    callback.llps_subfolder_source = stream_info.get("subfolder_source")
+    callback.llps_save_also_source = stream_info.get("save_also_source", "global_controller")
+    callback.llps_filename_prefix_source = stream_info.get("filename_prefix_source", "global_controller")
     callback.llps_last_preview_tuple = None
     callback.llps_last_preview_image_id = None
     callback.llps_last_callback_step = None
@@ -1026,6 +1164,7 @@ def _write_controller_metadata(
             "prompt_id": callback.llps_prompt_id,
             "run_id": callback.llps_run_id,
             "controller_node_id": controller.controller_node_id,
+            "stream_controller_node_id": callback.llps_stream_controller_node_id,
             "sampler_node_id": callback.llps_sampler_node_id,
             "sampler_node_type": callback.llps_sampler_node_type,
             "live_preview_method": controller.live_preview_method,
@@ -1037,6 +1176,10 @@ def _write_controller_metadata(
             "controller_subfolder": callback.llps_config.subfolder,
             "sampler_subfolder": callback.llps_sampler_subfolder,
             "effective_subfolder": callback.llps_effective_subfolder,
+            "subfolder_source": callback.llps_subfolder_source,
+            "stream_overrides": callback.llps_stream_overrides,
+            "save_also_source": callback.llps_save_also_source,
+            "filename_prefix_source": callback.llps_filename_prefix_source,
             "save_dir": callback.llps_save_dir,
             "filename_resolution_status": callback.llps_run_record.get("filename_resolution_status"),
             "final_output": None,
@@ -1102,6 +1245,28 @@ def _llps_common_ksampler(
             force_full_denoise=force_full_denoise,
         )
 
+    sampler_node_id = str(unique_id) if unique_id is not None else None
+    stream_controller = _stream_controller_from_prompt(prompt, sampler_node_id)
+    if stream_controller is not None and not stream_controller.enabled:
+        return _ORIGINAL_COMMON_KSAMPLER(
+            model,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent,
+            denoise=denoise,
+            disable_noise=disable_noise,
+            start_step=start_step,
+            last_step=last_step,
+            force_full_denoise=force_full_denoise,
+        )
+    controller, stream_info = _controller_with_stream_overrides(controller, stream_controller)
+    effective_sampler_subfolder = stream_info.get("stream_subfolder") or llps_subfolder
+
     latent_image = latent["samples"]
     latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image, latent.get("downscale_ratio_spacial", None))
 
@@ -1122,9 +1287,10 @@ def _llps_common_ksampler(
         controller,
         node_label,
         int(seed),
-        str(unique_id) if unique_id is not None else None,
+        sampler_node_id,
         node_type,
-        llps_subfolder,
+        effective_sampler_subfolder,
+        stream_info=stream_info,
     )
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
@@ -1304,6 +1470,12 @@ def _patch_builtin_samplers() -> None:
         controller = _active_controller_from_prompt(prompt)
         if controller is None:
             return original_custom_execute(model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image)
+        sampler_node_id = str(unique_id) if unique_id is not None else None
+        stream_controller = _stream_controller_from_prompt(prompt, sampler_node_id)
+        if stream_controller is not None and not stream_controller.enabled:
+            return original_custom_execute(model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image)
+        controller, stream_info = _controller_with_stream_overrides(controller, stream_controller)
+        effective_sampler_subfolder = stream_info.get("stream_subfolder")
 
         latent = latent_image
         latent_image = latent["samples"]
@@ -1329,9 +1501,11 @@ def _patch_builtin_samplers() -> None:
             controller,
             node_label,
             int(noise_seed),
-            str(unique_id) if unique_id is not None else None,
+            sampler_node_id,
             node_type,
+            effective_sampler_subfolder,
             x0_output_dict=x0_output,
+            stream_info=stream_info,
         )
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
@@ -1387,6 +1561,12 @@ def _patch_builtin_samplers() -> None:
         controller = _active_controller_from_prompt(prompt)
         if controller is None:
             return original_custom_advanced_execute(noise, guider, sampler, sigmas, latent_image)
+        sampler_node_id = str(unique_id) if unique_id is not None else None
+        stream_controller = _stream_controller_from_prompt(prompt, sampler_node_id)
+        if stream_controller is not None and not stream_controller.enabled:
+            return original_custom_advanced_execute(noise, guider, sampler, sigmas, latent_image)
+        controller, stream_info = _controller_with_stream_overrides(controller, stream_controller)
+        effective_sampler_subfolder = stream_info.get("stream_subfolder")
 
         latent = latent_image
         latent_image = latent["samples"]
@@ -1408,9 +1588,11 @@ def _patch_builtin_samplers() -> None:
             controller,
             node_label,
             seed,
-            str(unique_id) if unique_id is not None else None,
+            sampler_node_id,
             node_type,
+            effective_sampler_subfolder,
             x0_output_dict=x0_output,
+            stream_info=stream_info,
         )
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
@@ -1612,6 +1794,53 @@ class LLPSController:
         return ()
 
 
+class LLPSStreamController:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "enabled": ("BOOLEAN", {"default": True}),
+                "target_sampler_id": ("STRING", {"default": "", "multiline": False, "tooltip": "Sampler node id this Stream Controller applies to."}),
+                "override_save_also": ("BOOLEAN", {"default": False}),
+                "save_also": ("BOOLEAN", {"default": False}),
+                "override_subfolder": ("BOOLEAN", {"default": False}),
+                "subfolder": ("STRING", {"default": "", "multiline": False}),
+                "override_filename_prefix": ("BOOLEAN", {"default": False}),
+                "filename_prefix": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "make_stream_controller"
+    CATEGORY = LLPS_CATEGORY
+
+    def make_stream_controller(
+        self,
+        enabled=True,
+        target_sampler_id="",
+        override_save_also=False,
+        save_also=False,
+        override_subfolder=False,
+        subfolder="",
+        override_filename_prefix=False,
+        filename_prefix="",
+    ):
+        _stream = LLPSStreamControllerData.from_obj(
+            {
+                "enabled": enabled,
+                "target_sampler_id": target_sampler_id,
+                "override_save_also": override_save_also,
+                "save_also": save_also,
+                "override_subfolder": override_subfolder,
+                "subfolder": subfolder,
+                "override_filename_prefix": override_filename_prefix,
+                "filename_prefix": filename_prefix,
+            }
+        )
+        return ()
+
+
 class LLPSKSampler:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1738,12 +1967,14 @@ class LLPSKSampler:
 NODE_CLASS_MAPPINGS = {
     "LLPSConfig": LLPSConfig,
     "LLPSController": LLPSController,
+    "LLPSStreamController": LLPSStreamController,
     "LLPSKSampler": LLPSKSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LLPSConfig": "LLPS Config (Legacy)",
     "LLPSController": "LLPS Controller",
+    "LLPSStreamController": "LLPS Stream Controller",
     "LLPSKSampler": "LLPS KSampler (Legacy)",
 }
 

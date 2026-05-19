@@ -30,6 +30,9 @@ import nodes as comfy_nodes
 import comfy.sample
 import comfy.samplers
 import comfy.utils
+import comfy.model_management
+import comfy.nested_tensor
+import comfy_extras.nodes_custom_sampler as comfy_custom_sampler_nodes
 from comfy.cli_args import args
 from comfy_execution.utils import get_executing_context
 import folder_paths
@@ -45,7 +48,7 @@ TAESD_DECODER_URLS = {
     "taesd3_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taesd3_decoder.pth",
     "taef1_decoder": "https://raw.githubusercontent.com/madebyollin/taesd/main/taef1_decoder.pth",
 }
-LLPS_SAMPLER_TYPES = {"KSampler", "KSamplerAdvanced"}
+LLPS_SAMPLER_TYPES = {"KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced"}
 _LLPS_RUN_LOCK = threading.Lock()
 _LLPS_PREVIEW_RUNS: Dict[Tuple[str, str], list[Dict[str, Any]]] = {}
 
@@ -817,6 +820,7 @@ def _make_controller_callback(
     sampler_node_id: Optional[str],
     sampler_node_type: str,
     sampler_subfolder: Optional[str] = None,
+    x0_output_dict: Optional[Dict[str, Any]] = None,
 ):
     method = controller.live_preview_method
     show_preview = controller.enabled and method not in {"none", "disabled"}
@@ -859,6 +863,9 @@ def _make_controller_callback(
             _LLPS_PREVIEW_RUNS.setdefault((str(prompt_id), str(sampler_node_id)), []).append(run_record)
 
     def callback(step, x0, x, total_steps):
+        if x0_output_dict is not None:
+            x0_output_dict["x0"] = x0
+
         preview_tuple = None
         resolution_info = {}
         if previewer is not None:
@@ -963,6 +970,95 @@ def _make_controller_callback(
     return callback
 
 
+def _flush_controller_callback(
+    callback,
+    controller: LLPSControllerData,
+    node_label: str,
+    seed: int,
+    steps: int,
+) -> None:
+    if (
+        controller.save_also
+        and callback.llps_save_dir
+        and callback.llps_last_preview_tuple is not None
+    ):
+        try:
+            saved = _save_preview_image(
+                callback.llps_last_preview_tuple,
+                callback.llps_save_dir,
+                callback.llps_config,
+                node_label,
+                int(steps) - 1,
+                int(steps),
+                int(seed),
+                callback.llps_source_method,
+                temp_run_id=callback.llps_run_id,
+                sampler_node_id=callback.llps_sampler_node_id,
+            )
+            if saved:
+                callback.llps_saved_files.append(saved)
+                callback.llps_run_record["saved_files"].append(
+                    {
+                        "path": saved,
+                        "filename": os.path.basename(saved),
+                        "step": int(steps) - 1,
+                        "total_steps": int(steps),
+                    }
+                )
+        except Exception as e:
+            logging.exception("[LLPS] Controller failed to flush final preview image: %s", e)
+
+
+def _write_controller_metadata(
+    callback,
+    controller: LLPSControllerData,
+    sampler_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not (controller.save_also and callback.llps_config.save_metadata_json and callback.llps_save_dir):
+        return
+    try:
+        previewer_info = dict(callback.llps_previewer_info)
+        previewer_info["last_preview_image_id"] = callback.llps_last_preview_image_id
+        resolution_info = dict(callback.llps_last_preview_resolution or {})
+        metadata_filename = f"metadata_{callback.llps_run_id}.json"
+        metadata = {
+            "node": "LLPS Controller",
+            "prompt_id": callback.llps_prompt_id,
+            "run_id": callback.llps_run_id,
+            "controller_node_id": controller.controller_node_id,
+            "sampler_node_id": callback.llps_sampler_node_id,
+            "sampler_node_type": callback.llps_sampler_node_type,
+            "live_preview_method": controller.live_preview_method,
+            "preview_source_method": callback.llps_source_method,
+            "previewer_info": previewer_info,
+            "save_also": bool(controller.save_also),
+            "filename_prefix": callback.llps_config.filename_prefix,
+            "save_base_path": _save_base_dir(callback.llps_config),
+            "controller_subfolder": callback.llps_config.subfolder,
+            "sampler_subfolder": callback.llps_sampler_subfolder,
+            "effective_subfolder": callback.llps_effective_subfolder,
+            "save_dir": callback.llps_save_dir,
+            "filename_resolution_status": callback.llps_run_record.get("filename_resolution_status"),
+            "final_output": None,
+            "saved_count": len(callback.llps_saved_files),
+            "saved_files": [os.path.basename(p) for p in callback.llps_saved_files],
+            "renamed_files": [],
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            **resolution_info,
+        }
+        if sampler_metadata:
+            metadata.update(sampler_metadata)
+        callback.llps_run_record["metadata"] = metadata
+        callback.llps_run_record["metadata_path"] = os.path.join(callback.llps_save_dir, metadata_filename)
+        _write_metadata_json(
+            callback.llps_save_dir,
+            metadata,
+            metadata_filename,
+        )
+    except Exception as e:
+        logging.exception("[LLPS] Controller failed to write metadata.json: %s", e)
+
+
 _ORIGINAL_COMMON_KSAMPLER = comfy_nodes.common_ksampler
 _ORIGINAL_SAVE_IMAGE_INPUTS = comfy_nodes.SaveImage.INPUT_TYPES
 _ORIGINAL_SAVE_IMAGE_SAVE_IMAGES = comfy_nodes.SaveImage.save_images
@@ -1053,83 +1149,19 @@ def _llps_common_ksampler(
         seed=int(seed),
     )
 
-    if (
-        controller.save_also
-        and callback.llps_save_dir
-        and callback.llps_last_preview_tuple is not None
-    ):
-        try:
-            saved = _save_preview_image(
-                callback.llps_last_preview_tuple,
-                callback.llps_save_dir,
-                callback.llps_config,
-                node_label,
-                int(steps) - 1,
-                int(steps),
-                int(seed),
-                callback.llps_source_method,
-                temp_run_id=callback.llps_run_id,
-                sampler_node_id=callback.llps_sampler_node_id,
-            )
-            if saved:
-                callback.llps_saved_files.append(saved)
-                callback.llps_run_record["saved_files"].append(
-                    {
-                        "path": saved,
-                        "filename": os.path.basename(saved),
-                        "step": int(steps) - 1,
-                        "total_steps": int(steps),
-                    }
-                )
-        except Exception as e:
-            logging.exception("[LLPS] Controller failed to flush final preview image: %s", e)
-
-    if controller.save_also and callback.llps_config.save_metadata_json and callback.llps_save_dir:
-        try:
-            previewer_info = dict(callback.llps_previewer_info)
-            previewer_info["last_preview_image_id"] = callback.llps_last_preview_image_id
-            resolution_info = dict(callback.llps_last_preview_resolution or {})
-            metadata_filename = f"metadata_{callback.llps_run_id}.json"
-            metadata = {
-                "node": "LLPS Controller",
-                "prompt_id": callback.llps_prompt_id,
-                "run_id": callback.llps_run_id,
-                "controller_node_id": controller.controller_node_id,
-                "sampler_node_id": str(unique_id) if unique_id is not None else None,
-                "sampler_node_type": node_type,
-                "seed": int(seed),
-                "steps": int(steps),
-                "cfg": float(cfg),
-                "sampler_name": sampler_name,
-                "scheduler": scheduler,
-                "denoise": float(denoise),
-                "live_preview_method": controller.live_preview_method,
-                "preview_source_method": callback.llps_source_method,
-                "previewer_info": previewer_info,
-                "save_also": bool(controller.save_also),
-                "filename_prefix": callback.llps_config.filename_prefix,
-                "save_base_path": _save_base_dir(callback.llps_config),
-                "controller_subfolder": callback.llps_config.subfolder,
-                "sampler_subfolder": callback.llps_sampler_subfolder,
-                "effective_subfolder": callback.llps_effective_subfolder,
-                "save_dir": callback.llps_save_dir,
-                "filename_resolution_status": callback.llps_run_record.get("filename_resolution_status"),
-                "final_output": None,
-                "saved_count": len(callback.llps_saved_files),
-                "saved_files": [os.path.basename(p) for p in callback.llps_saved_files],
-                "renamed_files": [],
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                **resolution_info,
-            }
-            callback.llps_run_record["metadata"] = metadata
-            callback.llps_run_record["metadata_path"] = os.path.join(callback.llps_save_dir, metadata_filename)
-            _write_metadata_json(
-                callback.llps_save_dir,
-                metadata,
-                metadata_filename,
-            )
-        except Exception as e:
-            logging.exception("[LLPS] Controller failed to write metadata.json: %s", e)
+    _flush_controller_callback(callback, controller, node_label, int(seed), int(steps))
+    _write_controller_metadata(
+        callback,
+        controller,
+        {
+            "seed": int(seed),
+            "steps": int(steps),
+            "cfg": float(cfg),
+            "sampler_name": sampler_name,
+            "scheduler": scheduler,
+            "denoise": float(denoise),
+        },
+    )
 
     out = latent.copy()
     out.pop("downscale_ratio_spacial", None)
@@ -1163,12 +1195,32 @@ def _with_save_image_unique_id(input_types: Dict[str, Any]) -> Dict[str, Any]:
     return patched
 
 
-def _patch_builtin_samplers() -> None:
-    if getattr(comfy_nodes.KSampler, "_llps_controller_patch", False):
-        return
+def _with_llps_v3_hidden(schema):
+    hidden = list(getattr(schema, "hidden", None) or [])
+    for item in (comfy_custom_sampler_nodes.io.Hidden.prompt, comfy_custom_sampler_nodes.io.Hidden.unique_id):
+        if item not in hidden:
+            hidden.append(item)
+    schema.hidden = hidden
+    return schema
 
+
+def _v3_hidden(cls, name: str, default: Any = None) -> Any:
+    hidden = getattr(cls, "hidden", None)
+    value = getattr(hidden, name, None) if hidden is not None else None
+    return default if value is None else value
+
+
+def _object_label(obj: Any) -> str:
+    return str(getattr(obj, "name", None) or getattr(getattr(obj, "__class__", None), "__name__", None) or obj)
+
+
+def _patch_builtin_samplers() -> None:
     original_ksampler_inputs = comfy_nodes.KSampler.INPUT_TYPES
     original_advanced_inputs = comfy_nodes.KSamplerAdvanced.INPUT_TYPES
+    original_custom_schema = comfy_custom_sampler_nodes.SamplerCustom.define_schema
+    original_custom_execute = comfy_custom_sampler_nodes.SamplerCustom.execute
+    original_custom_advanced_schema = comfy_custom_sampler_nodes.SamplerCustomAdvanced.define_schema
+    original_custom_advanced_execute = comfy_custom_sampler_nodes.SamplerCustomAdvanced.execute
 
     @classmethod
     def ksampler_input_types(cls):
@@ -1237,12 +1289,190 @@ def _patch_builtin_samplers() -> None:
             llps_subfolder=llps_subfolder,
         )
 
-    comfy_nodes.KSampler.INPUT_TYPES = ksampler_input_types
-    comfy_nodes.KSampler.sample = ksampler_sample
-    comfy_nodes.KSamplerAdvanced.INPUT_TYPES = advanced_input_types
-    comfy_nodes.KSamplerAdvanced.sample = advanced_sample
-    comfy_nodes.KSampler._llps_controller_patch = True
-    comfy_nodes.KSamplerAdvanced._llps_controller_patch = True
+    @classmethod
+    def custom_schema(cls):
+        return _with_llps_v3_hidden(original_custom_schema())
+
+    @classmethod
+    def custom_advanced_schema(cls):
+        return _with_llps_v3_hidden(original_custom_advanced_schema())
+
+    @classmethod
+    def custom_execute(cls, model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image):
+        prompt = _v3_hidden(cls, "prompt")
+        unique_id = _v3_hidden(cls, "unique_id")
+        controller = _active_controller_from_prompt(prompt)
+        if controller is None:
+            return original_custom_execute(model, add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image)
+
+        latent = latent_image
+        latent_image = latent["samples"]
+        latent = latent.copy()
+        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image, latent.get("downscale_ratio_spacial", None))
+        latent["samples"] = latent_image
+
+        if not add_noise:
+            noise = comfy_custom_sampler_nodes.Noise_EmptyNoise().generate_noise(latent)
+        else:
+            noise = comfy_custom_sampler_nodes.Noise_RandomNoise(noise_seed).generate_noise(latent)
+
+        noise_mask = latent.get("noise_mask", None)
+        total_steps = max(0, int(sigmas.shape[-1]) - 1)
+        node_type = "SamplerCustom"
+        if isinstance(prompt, dict) and unique_id is not None:
+            node_type = prompt.get(str(unique_id), {}).get("class_type", node_type)
+        node_label = f"{node_type}_{unique_id or 'node'}"
+        x0_output = {}
+        callback = _make_controller_callback(
+            model,
+            total_steps,
+            controller,
+            node_label,
+            int(noise_seed),
+            str(unique_id) if unique_id is not None else None,
+            node_type,
+            x0_output_dict=x0_output,
+        )
+
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        samples = comfy.sample.sample_custom(
+            model,
+            noise,
+            float(cfg),
+            sampler,
+            sigmas,
+            positive,
+            negative,
+            latent_image,
+            noise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=int(noise_seed),
+        )
+
+        _flush_controller_callback(callback, controller, node_label, int(noise_seed), total_steps)
+        _write_controller_metadata(
+            callback,
+            controller,
+            {
+                "seed": int(noise_seed),
+                "steps": int(total_steps),
+                "cfg": float(cfg),
+                "sampler_name": _object_label(sampler),
+                "scheduler": "custom_sigmas",
+                "sigmas_count": int(sigmas.shape[-1]),
+                "denoise": None,
+                "hook_controlled": True,
+            },
+        )
+
+        out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out["samples"] = samples
+        if "x0" in x0_output:
+            x0_out = model.model.process_latent_out(x0_output["x0"].cpu())
+            if samples.is_nested:
+                latent_shapes = [x.shape for x in samples.unbind()]
+                x0_out = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0_out, latent_shapes))
+            out_denoised = latent.copy()
+            out_denoised["samples"] = x0_out
+        else:
+            out_denoised = out
+        return comfy_custom_sampler_nodes.io.NodeOutput(out, out_denoised)
+
+    @classmethod
+    def custom_advanced_execute(cls, noise, guider, sampler, sigmas, latent_image):
+        prompt = _v3_hidden(cls, "prompt")
+        unique_id = _v3_hidden(cls, "unique_id")
+        controller = _active_controller_from_prompt(prompt)
+        if controller is None:
+            return original_custom_advanced_execute(noise, guider, sampler, sigmas, latent_image)
+
+        latent = latent_image
+        latent_image = latent["samples"]
+        latent = latent.copy()
+        latent_image = comfy.sample.fix_empty_latent_channels(guider.model_patcher, latent_image, latent.get("downscale_ratio_spacial", None))
+        latent["samples"] = latent_image
+
+        noise_mask = latent.get("noise_mask", None)
+        total_steps = max(0, int(sigmas.shape[-1]) - 1)
+        seed = int(getattr(noise, "seed", 0) or 0)
+        node_type = "SamplerCustomAdvanced"
+        if isinstance(prompt, dict) and unique_id is not None:
+            node_type = prompt.get(str(unique_id), {}).get("class_type", node_type)
+        node_label = f"{node_type}_{unique_id or 'node'}"
+        x0_output = {}
+        callback = _make_controller_callback(
+            guider.model_patcher,
+            total_steps,
+            controller,
+            node_label,
+            seed,
+            str(unique_id) if unique_id is not None else None,
+            node_type,
+            x0_output_dict=x0_output,
+        )
+
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        samples = guider.sample(
+            noise.generate_noise(latent),
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=seed,
+        )
+        samples = samples.to(comfy.model_management.intermediate_device())
+
+        _flush_controller_callback(callback, controller, node_label, seed, total_steps)
+        _write_controller_metadata(
+            callback,
+            controller,
+            {
+                "seed": seed,
+                "steps": int(total_steps),
+                "sampler_name": _object_label(sampler),
+                "scheduler": "custom_sigmas",
+                "sigmas_count": int(sigmas.shape[-1]),
+                "guider_class": _object_label(guider),
+                "hook_controlled": True,
+            },
+        )
+
+        out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out["samples"] = samples
+        if "x0" in x0_output:
+            x0_out = guider.model_patcher.model.process_latent_out(x0_output["x0"].cpu())
+            if samples.is_nested:
+                latent_shapes = [x.shape for x in samples.unbind()]
+                x0_out = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0_out, latent_shapes))
+            out_denoised = latent.copy()
+            out_denoised["samples"] = x0_out
+        else:
+            out_denoised = out
+        return comfy_custom_sampler_nodes.io.NodeOutput(out, out_denoised)
+
+    if not getattr(comfy_nodes.KSampler, "_llps_controller_patch", False):
+        comfy_nodes.KSampler.INPUT_TYPES = ksampler_input_types
+        comfy_nodes.KSampler.sample = ksampler_sample
+        comfy_nodes.KSampler._llps_controller_patch = True
+    if not getattr(comfy_nodes.KSamplerAdvanced, "_llps_controller_patch", False):
+        comfy_nodes.KSamplerAdvanced.INPUT_TYPES = advanced_input_types
+        comfy_nodes.KSamplerAdvanced.sample = advanced_sample
+        comfy_nodes.KSamplerAdvanced._llps_controller_patch = True
+    if not getattr(comfy_custom_sampler_nodes.SamplerCustom, "_llps_controller_patch", False):
+        comfy_custom_sampler_nodes.SamplerCustom.define_schema = custom_schema
+        comfy_custom_sampler_nodes.SamplerCustom.execute = custom_execute
+        comfy_custom_sampler_nodes.SamplerCustom.sample = custom_execute
+        comfy_custom_sampler_nodes.SamplerCustom._llps_controller_patch = True
+    if not getattr(comfy_custom_sampler_nodes.SamplerCustomAdvanced, "_llps_controller_patch", False):
+        comfy_custom_sampler_nodes.SamplerCustomAdvanced.define_schema = custom_advanced_schema
+        comfy_custom_sampler_nodes.SamplerCustomAdvanced.execute = custom_advanced_execute
+        comfy_custom_sampler_nodes.SamplerCustomAdvanced.sample = custom_advanced_execute
+        comfy_custom_sampler_nodes.SamplerCustomAdvanced._llps_controller_patch = True
 
     @classmethod
     def save_image_input_types(cls):
@@ -1258,8 +1488,10 @@ def _patch_builtin_samplers() -> None:
             _rename_pending_previews_for_output(prompt_id, sampler_ids, output_images)
         return result
 
-    comfy_nodes.SaveImage.INPUT_TYPES = save_image_input_types
-    comfy_nodes.SaveImage.save_images = save_images
+    if not getattr(comfy_nodes.SaveImage, "_llps_controller_patch", False):
+        comfy_nodes.SaveImage.INPUT_TYPES = save_image_input_types
+        comfy_nodes.SaveImage.save_images = save_images
+        comfy_nodes.SaveImage._llps_controller_patch = True
 
 
 _patch_builtin_samplers()
